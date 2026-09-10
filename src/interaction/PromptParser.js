@@ -9,7 +9,8 @@
 // plauzibil, dar cu operatii inexistente, e mai rau decat un refuz — pare ca s-a
 // intamplat ceva si nu se intampla nimic.
 //
-// DSL-ul curent, acelasi pe care il emit agentii:
+// DSL-ul curent, acelasi pe care il emit agentii. `geom` e o operatie, sau o LISTA de
+// operatii aplicate pe rand — „fa un patrat de 100 si un dreptunghi de 300 pe 150":
 //   geom: { op:'rect',   w, h, at:{x,y}, anchor }
 //         { op:'canvas_resize', w, h }   gabaritul PANZEI, nu al figurilor
 //         { op:'split',  into, dir }
@@ -20,6 +21,8 @@
 //         { bind:'inside'|'pieces'|'path'|'sides'|'side'|'corners'|'corner'|'point'|
 //                'box'|'none',
 //           at, in, repeat, box:{w,h}, boxDelta }
+
+import { PANZA_MAX } from '../models/Scene.js';
 
 const NUM = { o: 1, un: 1, una: 1, doua: 2, doi: 2, trei: 3, patru: 4, cinci: 5, sase: 6 };
 
@@ -60,6 +63,27 @@ export const cerePanza = prompt => DESPRE_PANZA.test(norm(prompt));
 
 /** Cererea vorbeste despre figuri sau despre text? */
 export const cereObiecte = prompt => DESPRE_OBIECTE.test(norm(prompt));
+
+/**
+ * Cererea cere PE FATA ca textul sa stea pe o figura?
+ *
+ * Implicit un text nou e obiect de sine statator, asezat in mijlocul panzei — nu al
+ * figurii care se intampla sa fie pe ea. Cererea poate cere insa contrariul, si atunci
+ * ea decide: „scrie MIAU in patrat", „pe latura de sus", „in fiecare piesa".
+ *
+ * Tiparul sta aici, langa celelalte, si nu in App: acelasi text hotaraste si ce
+ * recunoaste rezerva locala, si ce se intampla cand modelul a raspuns.
+ *
+ * „In mijlocul panzei" e scos dinadins: acolo cuvantul „mijloc" numeste chiar pozitia
+ * implicita, nu o figura.
+ */
+const PE_FIGURA = new RegExp(
+  String.raw`\b(?:in|pe)\s+(?:interiorul\s+|mijlocul\s+|centrul\s+)?`
+  + String.raw`(?:figur|patrat|dreptunghi|form|latur|contur|colt|piesa|piese|fiecare)`
+  + String.raw`|\binauntr|\bin\s+mijloc\b|\bin\s+centru\b|\bde-a lungul`);
+
+/** Cererea numeste figura pe care sa stea textul? */
+export const cerePeFigura = prompt => PE_FIGURA.test(norm(prompt));
 
 const N = String.raw`(\d+|o|un|una|doi|doua|trei|patru|cinci|sase)`;
 
@@ -118,7 +142,9 @@ function punctDin(p) {
   const m = p.match(/\b(?:la|in|punctul|pozitia|coordonate|coordonatele)\b[^\d]{0,30}?(\d{1,4})\s*[,\s]\s*(\d{1,4})\b/);
   if (!m) return null;
   const x = +m[1], y = +m[2];
-  return x >= 0 && x <= 800 && y >= 0 && y <= 800 ? { x, y } : null;
+  // plafonul, nu panza de ACUM: rezerva locala nu stie cat e ea, iar `aplicaGeom`
+  // verifica oricum ca punctul cade pe panza inainte sa aseze ceva
+  return x >= 0 && x <= PANZA_MAX && y >= 0 && y <= PANZA_MAX ? { x, y } : null;
 }
 
 /**
@@ -200,6 +226,54 @@ function ancoraDin(p) {
   if (/(stanga[^.]*sus|sus[^.]*stanga)/.test(p)) return 'tl';
   if (/(dreapta[^.]*sus|sus[^.]*dreapta)/.test(p)) return 'tr';
   return null;
+}
+
+/**
+ * CATE figuri cere fraza: „fa 2 patrate de 100", „trei dreptunghiuri".
+ *
+ * Numarul sta INAINTEA substantivului; cel de dupa („de 100") e marimea, nu numarul.
+ * Fara regula asta „doua patrate" facea un singur patrat si al doilea cerea inca un
+ * prompt — exact drumul dus-intors pe care lantul de operatii il scuteste.
+ *
+ * @returns {number} cate, intre 1 si 8; 1 cand fraza nu spune
+ */
+function cateFiguri(p) {
+  const m = p.match(new RegExp(String.raw`\b` + N + String.raw`\s+(?:patrat|dreptunghi|figur|form)`));
+  const k = m ? num(m[1]) : 1;
+  return Number.isFinite(k) && k > 1 ? Math.min(k, 8) : 1;
+}
+
+/**
+ * Bucatile unei cereri insiruite: „fa un patrat de 100 SI un dreptunghi de 300 pe 150".
+ *
+ * Doar liantii care despart limpede doi pasi. Virgula NU e pe lista, desi in vorbire
+ * desparte si ea: in cererile astea ea tine de obicei doua coordonate — „la 400, 400" —
+ * si taiata acolo ar rupe punctul in doua bucati fara inteles.
+ */
+const clauze = p => p.split(/\s+(?:si|apoi|dupa care|plus)\s+|\s*;\s*/).filter(c => c.trim());
+
+/** O operatie sau un lant, mereu ca lista. */
+const lista = g => (Array.isArray(g) ? g : g ? [g] : []);
+
+/**
+ * Geometria ceruta: un pas, sau lantul intreg.
+ *
+ * Cererea se taie in bucati doar daca din ele chiar ies MAI MULTI pasi de geometrie.
+ * Altfel se citeste intreaga, ca pana acum — „scrie ALFA si BETA" are un singur „si",
+ * dar nicio bucata a lui nu e o operatie, iar taiata ar pierde jumatate din cuvinte.
+ */
+function geometrii(p, doar) {
+  // In caseta panzei nu se insiruie nimic: orice s-ar scrie acolo e un singur gabarit,
+  // iar doi pasi ar insemna o panza redimensionata de doua ori, din care se vede doar
+  // ultima.
+  if (doar !== 'panza') {
+    const bucati = clauze(p);
+    if (bucati.length > 1) {
+      const pasi = bucati.flatMap(b => lista(geometrie(b, doar)));
+      if (pasi.length > 1) return pasi;
+    }
+  }
+  return geometrie(p, doar);
 }
 
 /** Latimea si inaltimea: „300 pe 150", „300x150", „un patrat de 200". */
@@ -291,7 +365,13 @@ function geometrie(p, doar) {
     if (at) g.at = at;
     const anc = ancoraDin(p);
     if (anc) g.anchor = anc;
-    return g;
+
+    // „fa 2 patrate de 100": acelasi pas, repetat. Punctul, daca s-a dat, e al PRIMEI
+    // figuri — celelalte n-au unde sa cada peste ea, asa ca isi cauta singure locul.
+    const cate = cateFiguri(p);
+    if (cate === 1) return g;
+    const { at: _, ...faraLoc } = g;
+    return Array.from({ length: cate }, (unu, i) => (i ? { ...faraLoc } : g));
   }
 
   return null;
@@ -473,19 +553,21 @@ export function parse(prompt, doar) {
   // Fiecare caseta o refuza pe cealalta, pe fata. Mai bine un refuz limpede decat o
   // panza redimensionata din greseala, cand omul cerea un patrat de 200.
   if (doar === 'panza' && DESPRE_OBIECTE.test(p)) {
-    return { error: 'Caseta pânzei schimbă doar gabaritul — figurile și textul se cer în dreapta.' };
+    return { error: 'The canvas box only changes its size — shapes and text are requested on the right.' };
   }
   if (doar === 'figuri' && DESPRE_PANZA.test(p)) {
-    return { error: 'Gabaritul pânzei se cere în caseta din stânga.' };
+    return { error: 'The canvas size is requested in the box on the left.' };
   }
 
-  const geom = geometrie(p, doar);
+  const geom = geometrii(p, doar);
   const txt = doar === 'panza' ? null : text(p, prompt);
 
-  if (geom && (geom.op === 'rect' || geom.op === 'canvas_resize') && geom.w === undefined) {
-    return { error: 'Local nu știu cât de mare — scrie dimensiunea, de exemplu „300x150".' };
+  // Un singur pas fara dimensiune opreste cererea: motorul n-ar avea ce desena, iar un
+  // „nu stiu cat de mare" spus acum e mai bun decat o figura inventata.
+  if (lista(geom).some(g => (g.op === 'rect' || g.op === 'canvas_resize') && g.w === undefined)) {
+    return { error: 'Locally I do not know how big — write the size, for example "300x150".' };
   }
-  if (!geom && !txt) return { error: 'Nu am recunoscut nicio operație în prompt.' };
+  if (!geom && !txt) return { error: 'I did not recognise any operation in the prompt.' };
   const out = { geom: geom || null, text: txt || null };
   // „textul 1" tinteste al doilea TEXT, nu al doilea obiect: seriile sunt separate
   const tt = txt ? tintaTextDin(p) : null;
@@ -499,19 +581,31 @@ export function parse(prompt, doar) {
 // pe parse() de mai sus. Aplicatia nu ramane niciodata fara raspuns.
 // ---------------------------------------------------------------------------
 
-export async function parseRemote(prompt, state, doar) {
+/**
+ * @param {string} prompt cererea, asa cum a scris-o omul
+ * @param {object} state scena, asa cum o vede modelul
+ * @param {string} [doar] din ce caseta de comanda vine
+ * @param {string} [jeton] sesiunea. Cand serverul are conturi pornite, modelul e al
+ *        celor care au cont: fara antetul asta, `/api/parse` raspunde 401.
+ */
+export async function parseRemote(prompt, state, doar, jeton) {
+  let cod = 0;
   try {
     const r = await fetch('/api/parse', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        ...(jeton ? { Authorization: 'Bearer ' + jeton } : {}),
+      },
       body: JSON.stringify({ prompt, state, doar }),
       // plasa finala: chiar daca serverul atarna, dupa 30s cadem pe parserul local
       signal: AbortSignal.timeout(30000),
     });
+    cod = r.status;
     const j = await r.json();
     if (!r.ok) throw new Error(j.error || ('HTTP ' + r.status));
     const durata = j.ms ? ' · ' + (j.ms / 1000).toFixed(1) + 's' : '';
-    const retry = j.incercari > 1 ? ' · ' + j.incercari + ' încercări' : '';
+    const retry = j.incercari > 1 ? ' · ' + j.incercari + ' attempts' : '';
     // Ce agenti au raspuns. Cand apar amandoi, cererea a fost ambigua si fiecare a
     // raspuns pentru domeniul lui — merita vazut, altfel „doua schimbari dintr-o
     // cerere" arata ca o eroare.
@@ -519,12 +613,16 @@ export async function parseRemote(prompt, state, doar) {
     const ag = Array.isArray(j.agenti) && j.agenti.length
       ? ' · ' + j.agenti.map(a => NUME[a] || a).join('+') : '';
     // un raspuns tinut minte n-a costat nimic; merita spus, altfel „0 tokeni" deruteaza
-    const mem = j.memorat ? ' · din memorie' : '';
+    const mem = j.memorat ? ' · from memory' : '';
     return { ...j.dsl, _src: j.model + ag + mem + durata + retry, _usage: j.usage,
              _live: true, _memorat: Boolean(j.memorat) };
   } catch (e) {
+    // `_cod` merge mai departe fiindca 401 nu e o pana de model, e o sesiune pierduta,
+    // iar cele doua cer lucruri diferite: una se acopera cu rezerva locala, cealalta
+    // nu — acolo drumul e inapoi la poarta. Cine cheama decide; aici doar se raporteaza.
     const local = parse(prompt, doar);
-    return { ...local, _src: 'regex local', _live: false, _why: String(e.message || e) };
+    return { ...local, _src: 'regex local', _live: false, _cod: cod,
+             _why: String(e.message || e) };
   }
 }
 

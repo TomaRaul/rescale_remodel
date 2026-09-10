@@ -8,12 +8,14 @@
 //   - DSL cu "at" sau "cells"  -> creeaza obiecte noi pe celulele cerute
 //   - DSL fara coordonate      -> se aplica simultan pe tot ce e selectat
 //                                 (sau pe toate obiectele, daca nu e nimic selectat)
+//   - "geom" ca LISTA          -> pasii se aplica pe rand, dintr-un singur prompt,
+//                                 cu un singur Undo peste tot lantul
 //
 // INVARIANT: fiecare obiect isi conserva PROPRIUL Sum(len). Bugete independente,
 // ca o modificare pe un obiect sa nu miste altul.
 
 import { Figure } from '../models/Figure.js';
-import { Scene, Obiect, CELL, CANVAS_PX, PANZA_MIN, panza, AX, pointPixel, toLogic, inCanvas, nextText } from '../models/Scene.js';
+import { Scene, Obiect, CELL, CANVAS_PX, PANZA_MIN, PANZA_MAX, panza, AX, pointPixel, toLogic, inCanvas, nextText } from '../models/Scene.js';
 import { search, skeleton, flatCatalog, leafCount, addressable, registry } from '../models/ShapeBST.js';
 import { TextStream } from '../text/TextStream.js';
 import { OPS } from '../engines/Operations.js';
@@ -21,10 +23,11 @@ import { layout, schimbaCaseta, limCaseta, restrange, CASETA } from '../engines/
 import { Asezator } from '../text/Asezator.js';
 import { AnimationEngine } from '../engines/AnimationEngine.js';
 import { CanvasRenderer } from '../renderer/CanvasRenderer.js';
-import { InputManager } from '../interaction/InputManager.js';
-import { parseRemote, providerStatus, cereInlocuire, cerePanza, cereObiecte } from '../interaction/PromptParser.js';
-import { compare } from '../interaction/TokenMeter.js';
+import { InputManager, cuprinse } from '../interaction/InputManager.js';
+import { parseRemote, providerStatus, cereInlocuire, cerePanza, cereObiecte, cerePeFigura } from '../interaction/PromptParser.js';
+import { compare, est } from '../interaction/TokenMeter.js';
 import { CommandManager } from '../interaction/CommandManager.js';
+import { PanouCont } from '../cont/PanouCont.js';
 
 /**
  * Panza, asa cum o vede restul aplicatiei.
@@ -36,6 +39,16 @@ import { CommandManager } from '../interaction/CommandManager.js';
  */
 const CANVAS = { get w() { return panza.w; }, get h() { return panza.h; }, pad: 6 };
 const FONT = 17;
+
+/**
+ * Cat presupunem ca are promptul de sistem, cat timp n-am masurat inca unul adevarat.
+ *
+ * E doar un punct de plecare: la primul tur cu `usage` real, `convo.sys` il inlocuieste
+ * cu diferenta masurata. A stat pe 400 cat timp si estimatorul credea ca un token are
+ * patru caractere. Masurat cu tokenizatorul real, un tur cu UN singur agent costa ~1000
+ * de tokeni de instructiuni, iar unul ambiguu, cu toti trei, aproape 5000.
+ */
+const SYS_ESTIMAT = 1000;
 
 /**
  * Cat de mare poate ajunge litera cand creste odata cu caseta.
@@ -60,13 +73,22 @@ export class App {
   /** Legarile care se raporteaza la conturul figurii. Fara figura, n-au reper. */
   static FARA_FIGURA = new Set(['inside', 'pieces', 'path', 'sides', 'side']);
 
-  constructor() {
+  /**
+   * @param {import('../cont/Cont.js').Cont|null} cont contul deja autentificat.
+   *        Vine din afara, gata verificat de poarta: `App` nu autentifica pe nimeni,
+   *        doar foloseste jetonul. Null cand serverul n-are conturi configurate — si
+   *        atunci aplicatia merge ca inainte, doar ca nu salveaza nicaieri.
+   */
+  constructor(cont = null) {
+    this.cont = cont;
     this.renderer = new CanvasRenderer($('canvas'));
     this.renderer.resize(CANVAS.w, CANVAS.h, AX);
     this.renderer.setGrid(CELL);
 
     this.scena = new Scene();
     this.selectie = new Set();          // id-uri de obiect; goala = "toate"
+    this.cadruSelectie = null;          // dreptunghiul de selectie, cat timp e tras
+    this.bazaSelectie = new Set();      // selectia de la care pleaca incadrarea (Shift adauga la ea)
     this.history = new CommandManager();
     this.convo = { turns: 0, inTot: 0, outTot: 0, sys: 0, hist: [] };
     // Fiecare cadru poate veni cu alt gabarit de panza: elementul de desen se
@@ -85,7 +107,24 @@ export class App {
     $('addressable').textContent = addressable().toLocaleString('ro-RO');
     $('skelSize').textContent = this.skeleton.split('\n').length;
 
-    new InputManager($('canvas'), () => this.scene, (id, aditiv) => this.select(id, aditiv), AX);
+    new InputManager($('canvas'), () => this.scene, {   // el desparte gesturile, aici e doar ce urmeaza
+      select: (id, aditiv) => this.select(id, aditiv),      // click: alege
+      apuca: (id, aditiv) => this.apuca(id, aditiv),        // apasare pe un obiect, inca nelamurita
+      incepe: () => this.incepeMutarea(),                   // s-a lamurit: e o mutare
+      muta: (dx, dy) => this.mutaSelectia(dx, dy),
+      termina: () => this.terminaMutarea(),
+      incepeCadru: aditiv => this.incepeCadru(aditiv),      // s-a lamurit: e o incadrare
+      intindeCadru: r => this.intindeCadru(r),
+      terminaCadru: () => this.terminaCadru(),
+    }, AX);
+
+    // Panoul de cont nu stie nimic despre figuri: primeste contul si doua functii, una
+    // care ii da scena ca date si una care i-o pune la loc. Cand serverul n-are conturi
+    // configurate, se sterge singur din pagina si nu se mai aude de el.
+    this.panou = new PanouCont(cont, {
+      stare: () => this.scena.toJSON(),
+      incarca: date => this.incarcaScena(date),
+    });
 
     this.wire();
     this.draw(true);
@@ -95,6 +134,41 @@ export class App {
 
   faceStream(words = [], fontPx = FONT) {
     return new TextStream(words, this.renderer.ctx, fontPx);
+  }
+
+  /**
+   * Jetonul cu care pleaca cererile spre server, sau sirul gol.
+   *
+   * Se cere contului la FIECARE apel, nu se tine minte: un jeton are viata scurta, iar
+   * clientul il reimprospateaza singur cand e cazul. Gol inseamna „server fara conturi",
+   * si atunci `/api/parse` nici nu cere unul.
+   */
+  async jeton() {
+    return this.cont ? this.cont.jeton() : '';
+  }
+
+  /**
+   * Scena adusa din cont, pusa pe pânză.
+   *
+   * Instantaneul se salveaza INAINTE, deci o incarcare gresita se desface cu Undo, ca
+   * orice alta schimbare. Fara asta, un click pe numele altei panze ar sterge fara
+   * intoarcere ce era pe ecran.
+   *
+   * Dupa asezare se restrange in cadru: o pânză salvata cand plafonul era altul, sau
+   * pe un ecran cu alte marimi, poate avea obiecte cazute in afara. Translatia nu
+   * atinge nicio lungime, deci Sum(len) al fiecarui obiect ramane cel salvat.
+   *
+   * @returns {number} cate obiecte au ajuns pe pânză
+   */
+  incarcaScena(date) {
+    this.history.push(this.scena.snapshot());
+    const n = this.scena.incarca(date, (w, f) => this.faceStream(w, f));
+    this.selectie.clear();
+    this.restrangeToate(null);
+    this.actualizeazaCentre();
+    this.draw();
+    this.inspect();
+    return n;
   }
 
   async showProvider() {
@@ -134,13 +208,244 @@ export class App {
       this.draw(); this.inspect();
     };
     $('deselect').onclick = () => { this.selectie.clear(); this.draw(); this.inspect(); };
+    $('inCaseta').onclick = () => this.comutaCaseta();
+  }
+
+  // ---------------------------------------------------------------- caseta, din interfata
+
+  /** Obiectele vizate care chiar au text: pe ele cad comenzile locale de text. */
+  texteVizate() { return this.tinte().filter(o => o.stream.words.length); }
+
+  /** Textul obiectului sta deja intr-o caseta? */
+  static inCaseta(o) {
+    return o.binds.some(b => b && typeof b === 'object' && b.bind === 'box');
+  }
+
+  /**
+   * Pune textul selectat intr-o caseta, sau il scoate din ea. Local, fara model.
+   *
+   * Ambalarea unui text era pana acum numai o cerere de prompt — „pune textul intr-o
+   * caseta" — adica un drum la model si tokenii lui pentru o comanda care n-are nimic
+   * de tradus: ce text, se stie din selectie; ce sa se faca, se stie din buton. E
+   * aceeasi socoteala ca la mutarea cu mouse-ul: ce se poate arata cu degetul nu se
+   * mai scrie in cuvinte.
+   *
+   * Butonul face si drumul invers. Fara el, un text bagat din greseala in caseta ar
+   * cere tocmai promptul de care butonul scuteste.
+   *
+   * Cade pe aceleasi obiecte pe care ar cadea si un prompt: selectia, sau tot ce e pe
+   * panza cand nu e nimic selectat. Instantaneul se salveaza o data, deci un Undo
+   * desface apasarea intreaga, oricate texte ar fi atins.
+   */
+  comutaCaseta() {
+    const vizate = this.texteVizate();
+    if (!vizate.length) return;                 // butonul e oricum stins; aici e plasa
+
+    this.history.push(this.scena.snapshot());
+    // Se scoate doar cand TOATE sunt deja in caseta. Cu o selectie amestecata, apasarea
+    // le aduce pe toate la aceeasi stare — altfel butonul ar face doua lucruri deodata,
+    // iar a doua apasare le-ar intoarce exact pe dos.
+    const scoate = vizate.every(o => App.inCaseta(o));
+    for (const o of vizate) {
+      if (scoate) this.scoateDinCaseta(o);
+      else this.aplicaText(o, { bind: 'box' });
+    }
+    this.draw(); this.inspect();
+  }
+
+  /**
+   * Scoate textul din caseta, lasandu-l exact unde se vede.
+   *
+   * Legarea de dinainte de caseta nu se tine minte nicaieri, deci se alege cea fireasca:
+   * pe o figura textul se intoarce inauntrul ei, unde ar fi stat oricum. Un text liber
+   * n-are contur de care sa se agate, asa ca ramane legat de PUNCTUL in care caseta il
+   * desena — fara el ar sari in (0,0), bbox-ul unui obiect fara figura, adica in coltul
+   * panzei. Rotatia calatoreste cu legarea, deci se muta odata cu ea.
+   */
+  scoateDinCaseta(o) {
+    const unde = this.undeSta(o);              // citit CAT timp caseta inca aseaza textul
+    o.binds = o.binds.map(b => {
+      if (!b || typeof b !== 'object' || b.bind !== 'box') return b;
+      if (!o.figure.isEmpty) return b.rot ? { bind: 'inside', rot: b.rot } : 'inside';
+      // fiecare legare isi primeste PROPRIUL punct: unul singur, impartit intre ele, ar
+      // fi mutat de tot atatea ori la prima translatie
+      const at = { ...(unde || pointPixel(o.at.x, o.at.y)) };
+      return b.rot ? { bind: 'point', at, rot: b.rot } : { bind: 'point', at };
+    });
   }
 
   select(id, aditiv) {
-    if (id === null) this.selectie.clear();
+    if (id === null) { if (!aditiv) this.selectie.clear(); }   // cu Shift, un click pe langa nu darama selectia
     else if (aditiv) this.selectie.has(id) ? this.selectie.delete(id) : this.selectie.add(id);
     else { this.selectie.clear(); this.selectie.add(id); }
     this.draw(); this.inspect();
+  }
+
+  // ---------------------------------------------------------------- mutarea cu mouse-ul
+
+  /**
+   * Apasarea pe un obiect, inainte sa se stie daca urmeaza un click sau o tragere.
+   *
+   * Obiectul apucat trebuie sa fie selectat pana sa inceapa mutarea, altfel s-ar trage
+   * altceva decat ce tine degetul. O selectie care il contine DEJA nu se strica: asa se
+   * pot muta mai multe obiecte odata, apucandu-le de oricare dintre ele. Cu Shift la fel:
+   * acolo omul construieste o selectie, iar apasarea n-are de ce sa o rupa.
+   */
+  apuca(id, aditiv) {
+    if (aditiv || this.selectie.has(id)) return;        // selectia e deja buna: n-o strica
+    this.selectie = new Set([id]);
+    this.draw(); this.inspect();
+  }
+
+  /** Obiectele pe care le trage gestul curent: exact selectia, niciodata „toate". */
+  mutabile() { return this.scena.obiecte.filter(o => this.selectie.has(o.id)); }
+
+  /**
+   * Inceputul unei mutari cu mouse-ul.
+   *
+   * Instantaneul se salveaza O SINGURA DATA, aici, nu la fiecare cadru: un Undo
+   * desface gestul intreg, nu ultimul pixel din el.
+   */
+  incepeMutarea() {
+    this.history.push(this.scena.snapshot());
+    for (const o of this.mutabile()) this.ancoreaza(o);
+  }
+
+  /**
+   * Trage selectia cu (dx, dy) pixeli de canvas.
+   *
+   * Doar TRANSLATIE: nicio lungime nu se atinge, deci Sum(len) al fiecarui obiect ramane
+   * neatins, ca la orice mutare. Deplasarea se taie o data, pe gabaritul COMUN, si se
+   * aplica la fel tuturor — asa selectia se misca dintr-o bucata pana in margine.
+   */
+  mutaSelectia(dx, dy) {
+    const vizate = this.mutabile();
+    if (!vizate.length || (!dx && !dy)) return;
+    ({ dx, dy } = this.limiteazaLaPanza(vizate, dx, dy));
+    if (!dx && !dy) return;      // selectia sta deja pe margine, in directia asta nu mai e loc
+    for (const o of vizate) {
+      Scene.mutaCanvas(o, dx, dy);
+      o.at = { x: Math.round(o.at.x + dx), y: Math.round(o.at.y - dy) };  // y logic creste in SUS
+    }
+    this.draw(true);             // fara animatie: un cadru interpolat ar alerga dupa cursor cu 900ms
+  }
+
+  /**
+   * Cat din (dx, dy) incape fara ca SELECTIA sa iasa din panza.
+   *
+   * Se taie pe gabaritul COMUN al obiectelor trase, si abia apoi se aplica tuturor. Cand
+   * fiecare obiect era restrans separat — asa se facea, cu „restrangeToate" dupa mutare —
+   * cel ajuns la margine se oprea, iar celalalt mergea inainte cu cursorul: doua figuri
+   * trase impreuna se strangeau una in alta si ramaneau in linie, desi gestul era o
+   * simpla translatie. Aici prima muchie atinsa opreste toata selectia pe axa aceea, iar
+   * cealalta axa ramane libera — de-a lungul marginii selectia tot aluneca, intreaga.
+   *
+   * Distantele dintre obiecte nu se schimba niciodata: toate primesc acelasi (dx, dy).
+   *
+   * Pe axa pe care selectia e mai lata decat panza nu se taie nimic — n-ar exista pozitie
+   * buna, la fel ca in „restrange", iar taierea ar bloca gestul pe loc.
+   *
+   * @returns {{dx:number, dy:number}} deplasarea care se poate face acum
+   */
+  limiteazaLaPanza(vizate, dx, dy, pad = CANVAS.pad) {
+    const parti = vizate.map(o => this.gabaritObiect(o)).filter(Boolean);
+    if (!parti.length) return { dx, dy };
+    const b = {
+      minX: Math.min(...parti.map(p => p.minX)), maxX: Math.max(...parti.map(p => p.maxX)),
+      minY: Math.min(...parti.map(p => p.minY)), maxY: Math.max(...parti.map(p => p.maxY)),
+    };
+    // Marginile intre care se poate duce gabaritul; ce iese in afara lor se taie. Cand
+    // selectia e deja iesita, capatul de jos e pozitiv si o aduce inapoi, ca inainte.
+    const axa = (min, max, limita, d) => {
+      if (max - min > limita - 2 * pad + 1e-6) return d;      // nu incape: nu se taie nimic
+      return Math.min(Math.max(d, pad - min), limita - pad - max);
+    };
+    return { dx: axa(b.minX, b.maxX, CANVAS.w, dx), dy: axa(b.minY, b.maxY, CANVAS.h, dy) };
+  }
+
+  /** Sfarsitul gestului: centrele se refac si panourile se reimprospateaza o data. */
+  terminaMutarea() {
+    this.actualizeazaCentre();
+    this.draw(true);
+    this.inspect();
+  }
+
+  /**
+   * Inceputul unei incadrari: se retine selectia de la care se pleaca.
+   *
+   * Cu Shift cadrul ADAUGA la ce era selectat, fara el ia de la zero. Baza se tine
+   * minte aici fiindca dreptunghiul se rescrie la fiecare cadru: fara ea, obiectele
+   * ramase in urma cursorului ar iesi din selectie, dar cele adunate cu Shift inainte
+   * de gest ar iesi si ele.
+   */
+  incepeCadru(aditiv) { this.bazaSelectie = aditiv ? new Set(this.selectie) : new Set(); }
+
+  /**
+   * Dreptunghiul de acum: se deseneaza, si selectia il urmeaza pe loc.
+   *
+   * Selectia se recalculeaza la fiecare pas, nu doar la ridicarea butonului: asa se vede
+   * CAT TRAGI ce va fi prins — ce e cuprins se aprinde, restul se estompeaza, cu aceeasi
+   * evidentiere ca la un click. Fara asta ai trage in orb si ai afla abia la final ca ai
+   * ratat o figura cu doi pixeli.
+   */
+  intindeCadru(r) {
+    this.cadruSelectie = r;
+    this.selectie = new Set([...this.bazaSelectie, ...cuprinse(this.scene, r)]);   // baza tine ce a adunat Shift
+    this.draw(true);
+  }
+
+  /** Ridicarea butonului: dreptunghiul dispare, selectia ramane cum s-a vazut. */
+  terminaCadru() {
+    this.cadruSelectie = null;
+    this.bazaSelectie = new Set();
+    this.draw(true);
+    this.inspect();
+  }
+
+  /**
+   * Ancoreaza in pixeli un text care atarna de PANZA, nu de o figura.
+   *
+   * Un text pus „in coltul din stanga sus" n-are punct al lui: coltul e al panzei, iar
+   * o translatie n-are ce sa mute in el — obiectul s-ar vedea selectat si ar sta pe loc.
+   * Cand un asemenea text e tras cu mouse-ul, legarea devine una pe PUNCT, fix acolo
+   * unde se desena: imaginea nu se schimba cu nimic, dar de-acum textul are un loc al
+   * lui, care se poate muta.
+   *
+   * Numai pe obiectele FARA figura. Cand exista un contur, o legare de panza chiar asta
+   * inseamna — text ancorat de rama, nu de figura — si ramane cum e; tragerea muta
+   * figura, iar textul isi pastreaza coltul, fiindca despre coltul panzei era vorba.
+   */
+  ancoreaza(o) {
+    const areLoc = b => b?.at && typeof b.at === 'object';   // un colt e un sir, nu un punct
+    if (!o.figure.isEmpty || o.binds.every(areLoc)) return;
+
+    const sc = layout(o.figure, o.stream, o.binds, CANVAS);
+    const unde = new Map(sc.words.map(w => [w.i, w]));
+    const cutie = sc.casete[0];
+    const centru = w => App.centruCuvant(w, o.stream.advance[w.i] || 0);
+
+    o.binds = o.binds.map((b, i) => {
+      const w = unde.get(i);
+      if (areLoc(b) || !w) return b;                         // deja ancorat, ori cuvant ascuns
+      if (b?.bind !== 'box') return { bind: 'point', at: centru(w) };
+      return { ...b, at: cutie                               // caseta se ancoreaza de mijlocul ei
+        ? { x: cutie.x + cutie.w / 2, y: cutie.y + cutie.h / 2 }
+        : centru(w) };
+    });
+  }
+
+  /**
+   * Centrul unui cuvant asa cum se DESENEAZA, oricare i-ar fi alinierea.
+   *
+   * Legarea pe punct centreaza cuvantul in el, dar una de colt il aliniaza la rama. Fara
+   * conversia asta, un text mutat din colt ar sari cu jumatate din latimea lui chiar in
+   * clipa in care e apucat.
+   */
+  static centruCuvant(w, lat) {
+    return {
+      x: { right: w.x - lat / 2, left: w.x + lat / 2 }[w.align] ?? w.x,
+      y: { bottom: w.y - w.size / 2, top: w.y + w.size / 2 }[w.baseline] ?? w.y,
+    };
   }
 
   /**
@@ -269,7 +574,9 @@ export class App {
     // Gabaritul panzei intra in scena, deci se si animeaza: dupa „micsoreaza canvasul
     // la 250 pe 100" elementul de desen se strange pe aceeasi curba ca figurile, nu
     // sare intr-un cadru.
-    this.scene = { edges, words, casete, panza: { w: CANVAS.w, h: CANVAS.h } };
+    this.scene = { edges, words, casete,
+                   cadru: this.cadruSelectie,          // nu e continut, dar tot pe panza se deseneaza
+                   panza: { w: CANVAS.w, h: CANVAS.h } };
     this.anim.goTo(this.scene, instant);
   }
 
@@ -383,12 +690,12 @@ export class App {
     if (primul) {
       const info = this.nodeInfo(primul.figure);
       $('bstPath').textContent = info.cod;
-      $('bstLeaf').innerHTML = info.nume + (info._hit.learned ? ' <span class="new">FIGURĂ NOUĂ</span>' : '');
+      $('bstLeaf').innerHTML = info.nume + (info._hit.learned ? ' <span class="new">NEW SHAPE</span>' : '');
       $('bstQ').innerHTML = info._hit.questions.map(q => `<div class="q">${q}</div>`).join('');
       $('bstCmp').textContent = `${info._hit.comparisons} atribute (constant)`;
     } else {
       $('bstPath').textContent = '—';
-      $('bstLeaf').textContent = 'pânză goală';
+      $('bstLeaf').textContent = 'empty canvas';
       $('bstQ').innerHTML = '';
       $('bstCmp').textContent = '—';
     }
@@ -404,20 +711,34 @@ export class App {
     const n = this.scena.length;
     const numere = this.figuri().map((o, k) => (this.selectie.has(o.id) ? `#${k}` : null)).filter(Boolean);
     $('selInfo').innerHTML = !n
-      ? '<span class="dim">pânza e goală — cere o figură, opțional cu coordonate</span>'
+      ? '<span class="dim">the canvas is empty — ask for a shape, optionally with coordinates</span>'
       : this.selectie.size
-        ? `selectate: <b>${numere.join(' ')}</b> din ${n} · comenzile fără țintă se aplică pe ele`
-        : `<span class="dim">${n} obiecte, niciunul selectat — comenzile se aplică pe <b>toate</b></span>`;
+        ? `selected: <b>${numere.join(' ')}</b> of ${n} · commands without a target apply to them`
+        : `<span class="dim">${n} objects, none selected — commands apply to <b>all</b> of them</span>`;
 
     $('payload').textContent = JSON.stringify(p, null, 1);
+    // Ce priveste o comanda de text: selectia, sau tot, cand nu e nimic selectat. Aceeasi
+    // regula si pentru evidentiere, si pentru buton — ce se vede aprins e ce se va schimba.
+    const active = p.texte.filter(t => !this.selectie.size || t.sel);
     // textele isi arata numarul lor, T0, T1 ..., si unde stau: pe o figura sau libere
     $('textState').innerHTML = p.texte.length
       ? p.texte.map(t => {
-          const activ = !this.selectie.size || t.sel;
           const unde = t.pe !== null ? `pe #${t.pe}` : `liber @${t.at.x},${t.at.y}`;
-          return `<span class="chip" style="opacity:${activ ? 1 : .4}">T${t.i} ${unde}: ${t.cuvinte.join(' ')}</span>`;
+          return `<span class="chip" style="opacity:${active.includes(t) ? 1 : .4}">T${t.i} ${unde}: ${t.cuvinte.join(' ')}</span>`;
         }).join('')
-      : '<span class="dim">niciun text</span>';
+      : '<span class="dim">no text</span>';
+
+    // Butonul de caseta isi spune singur ce face si pe ce cade: numele textelor, nu o
+    // cifra. Cand nu e niciun text de ambalat, se stinge — o apasare fara efect ar
+    // parea o defectiune.
+    const cuText = this.texteVizate();
+    const scoate = cuText.length > 0 && cuText.every(o => App.inCaseta(o));
+    const nume = active.map(t => 'T' + t.i).join(', ');
+    $('inCaseta').disabled = !cuText.length;
+    $('inCaseta').textContent = scoate ? 'Take out of the box' : 'Put in a box';
+    $('inCaseta').title = cuText.length
+      ? `${scoate ? 'take out of the box' : 'put in a box'}: ${nume}`
+      : 'no text to put in a box';
     return p;
   }
 
@@ -429,7 +750,9 @@ export class App {
    * @returns {{w:number,h:number}|null} null daca cererea nu spune cat de mare
    */
   dimensiuni(g) {
-    const lim = v => Math.max(1, Math.min(CANVAS_PX, Math.round(v)));
+    // plafonul e cea mai MARE panza, nu cea de pornire: pe una crescuta la 1200 o
+    // figura de 1000 e o cerere cinstita, si ar fi fost taiata la 800 fara motiv
+    const lim = v => Math.max(1, Math.min(PANZA_MAX, Math.round(v)));
     const w = Number(g.w), h = Number(g.h), s = Number(g.size);
     if (Number.isFinite(w) && Number.isFinite(h)) return { w: lim(w), h: lim(h) };
     if (Number.isFinite(s)) return { w: lim(s), h: lim(s) };
@@ -473,8 +796,8 @@ export class App {
     // hexagon, stea — nu se potriveau niciodata cu nimic: cod care se citeste ca o
     // capabilitate, dar nu poate tinti nicio figura.
     const REGULI = [
-      [/\bdreptunghi/, n => n.includes('DREPTUNGHI')],
-      [/\bpatrat/,     n => n.includes('PATRAT')],
+      [/\bdreptunghi/, n => n.includes('RECTANGLE')],
+      [/\bpatrat/,     n => n.includes('SQUARE')],
     ];
 
     // se potrivesc doar FIGURI: numerele deduse aici sunt numere de figura, #0, #1
@@ -527,6 +850,72 @@ export class App {
 
 
   /**
+   * Un punct in care o figura noua nu cade peste alta.
+   *
+   * Se pleaca din centrul panzei — acolo cade si prima figura — si, daca e ocupat, se
+   * incearca puncte tot mai departate, din celula in celula: intai pe orizontala, ca
+   * doua figuri cerute deodata sa iasa una langa alta, cum se si asteapta cineva care
+   * a scris „fa doua patrate".
+   *
+   * Figura de proba chiar se CONSTRUIESTE, nu se socoteste gabaritul dupa w si h: asa
+   * ancora ceruta („cu coltul stanga jos in punct") e luata in seama exact, nu aproximat.
+   *
+   * Cand nu incape nicaieri, se intoarce tot centrul: se suprapune, ca pana acum. O
+   * panza plina nu e un motiv sa nu se intample nimic.
+   */
+  locLiber(g) {
+    const centru = { x: panza.w >> 1, y: panza.h >> 1 };
+    const ocupate = this.scena.obiecte.map(o => this.gabaritObiect(o)).filter(Boolean);
+    if (!ocupate.length) return centru;
+
+    // marginile care se ating nu inseamna suprapunere: doua figuri lipite sunt doua
+    const liber = at => {
+      const b = this.creeaza(g, at).bbox();
+      return b && !ocupate.some(q => b.minX < q.maxX && q.minX < b.maxX
+                                  && b.minY < q.maxY && q.minY < b.maxY);
+    };
+    if (liber(centru)) return centru;
+
+    for (let r = CELL; r <= Math.max(panza.w, panza.h); r += CELL) {
+      for (const at of App.inel(centru, r)) {
+        if (inCanvas(at.x, at.y) && liber(at)) return at;
+      }
+    }
+    return centru;
+  }
+
+  /**
+   * Punctele de pe un inel patrat in jurul lui `c`, la distanta `r`, din celula in celula.
+   *
+   * Ordinea conteaza: intai cele de pe orizontala, apoi cele departate de ea, iar la
+   * egalitate cel din DREAPTA. Asa un sir de figuri creste in linie, spre dreapta, in
+   * loc sa se imprastie in jurul centrului.
+   */
+  static inel(c, r) {
+    const pasi = [];
+    for (let d = -r; d <= r; d += CELL) pasi.push(d);
+    const puncte = [];
+    for (const dx of pasi) {
+      for (const dy of pasi) {
+        if (Math.max(Math.abs(dx), Math.abs(dy)) === r) puncte.push({ x: c.x + dx, y: c.y + dy });
+      }
+    }
+    return puncte.sort((a, b) => Math.abs(a.y - c.y) - Math.abs(b.y - c.y)
+                             || Math.abs(a.x - c.x) - Math.abs(b.x - c.x)
+                             || b.x - a.x);
+  }
+
+  /**
+   * Operatiile de geometrie ale unui tur, mereu ca lista.
+   *
+   * O cerere obisnuita aduce un obiect, una insiruita o lista. Restul codului nu are de
+   * ce sa stie care din doua: de aici incolo sunt mereu pasi, si cand e unul singur.
+   */
+  static operatii(geom) {
+    return (Array.isArray(geom) ? geom : geom ? [geom] : []).filter(g => g && g.op);
+  }
+
+  /**
    * Pune un obiect pe un punct. Implicit SE SUPRAPUNE peste ce era acolo — mai multe
    * figuri pot porni din acelasi punct de origine, fiecare cu textul si bugetul ei.
    *
@@ -555,7 +944,7 @@ export class App {
     const areContinut = (Array.isArray(t.set) && t.set.length)
                      || (Array.isArray(t.add) && t.add.length);
     if (!areContinut) {
-      notes.push('nu există text pe care să-l schimb — scrie întâi ceva, de exemplu „scrie MIAU"');
+      notes.push('there is no text to change — write something first, for example "scrie MIAU"');
       return null;
     }
 
@@ -574,8 +963,8 @@ export class App {
     if (t.bind !== 'box') t.bind = 'point';
     if (cerut) t.at = p; else delete t.at;
     notes.push(cerut
-      ? `text fără figură, așezat în (${p.x},${p.y})`
-      : 'text nou, obiect separat');
+      ? `text with no shape, placed at (${p.x},${p.y})`
+      : `new text, a separate object, in the middle of the canvas (${p.x},${p.y})`);
     return o;
   }
 
@@ -665,7 +1054,7 @@ export class App {
       const peDest = vizate.find(v => v.o === dest);
       const words = peDest && peDest.words ? peDest.words : undefined;
       this.aplicaText(dest, { ...t, set: undefined, add: undefined, words }, notes);
-      notes.push(`textul era deja pe figura #${destIdx}, doar reașezat`);
+      notes.push(`the text was already on shape #${destIdx}, only re-placed`);
       return dest;
     }
 
@@ -778,14 +1167,13 @@ export class App {
     // ce ocupa deja panza: textele celorlalte obiecte, plus cuvintele acestui obiect
     // care NU fac parte din grupul asezat acum
     const sc = layout(o.figure, o.stream, o.binds, CANVAS);
+    // Doar TEXTELE ocupa loc, nu si contururile. Un text nou cade in mijlocul panzei,
+    // iar o figura desenata acolo nu-l mai impinge deoparte: pozitia lui e a panzei,
+    // nu a figurii. Conturul a stat o vreme pe lista, si atunci textul fugea din
+    // centru de fiecare data cand exista o figura — adica exact locul cerut.
+    // Doua texte tot nu se calca: pentru asta lista ramane.
     const ocupate = [
       ...this.scena.obiecte.filter(x => x !== o).flatMap(x => this.dreptunghiuriText(x)),
-      // si CONTURURILE desenate: un text fara tinta n-are de ce sa cada peste o figura,
-      // cand tocmai faptul ca nu e a niciuneia l-a facut obiect de sine statator
-      ...this.scena.obiecte.filter(x => x !== o && !x.figure.isEmpty).map(x => {
-        const b = x.figure.bbox();
-        return { x: b.minX, y: b.minY, w: b.maxX - b.minX, h: b.maxY - b.minY };
-      }),
       ...sc.words.filter(w => !inGrup.has(w.i)).map(w => {
         const lat = o.stream.advance[w.i] || w.text.length * w.size * 0.6;
         return { x: w.x - lat / 2, y: w.y - w.size / 2, w: lat, h: w.size };
@@ -801,7 +1189,7 @@ export class App {
       o.binds[k] = mod;
     });
     o.at = toLogic(p.x, p.y);
-    if (notes) notes.push(`text nou așezat în (${o.at.x},${o.at.y}), fără suprapunere`);
+    if (notes) notes.push(`new text placed at (${o.at.x},${o.at.y}), without overlap`);
   }
 
   /**
@@ -987,7 +1375,7 @@ export class App {
       notes.push(r.caseta
         ? `caseta ${cerut} → ${r.caseta.w}×${r.caseta.h > 0 ? r.caseta.h : 'auto'}px`
           + `, text ×${r.raport.toFixed(2)}`
-        : 'nu există casetă de redimensionat — pune întâi textul într-una, de exemplu „pune textul într-o casetă"');
+        : 'there is no box to resize — put the text in one first, for example "pune textul intr-o caseta"');
     }
 
     // 4d. Text FARA figura: legarile care se raporteaza la laturi n-au la ce se
@@ -1096,7 +1484,7 @@ export class App {
     }
 
     if (notes) {
-      notes.push(`scena scalată ×${kx.toFixed(2)} pe lățime, ×${ky.toFixed(2)} pe înălțime`);
+      notes.push(`scene scaled ×${kx.toFixed(2)} in width, ×${ky.toFixed(2)} in height`);
     }
     return this.scena.length;
   }
@@ -1121,9 +1509,7 @@ export class App {
     const cadru = { w: CANVAS.w, h: CANVAS.h, pad };
     let mutate = 0, mari = 0;
     for (const o of this.scena.obiecte) {
-      const b = o.figure.isEmpty
-        ? App.gabaritCanvas(this.dreptunghiuriText(o))
-        : o.figure.bbox();
+      const b = this.gabaritObiect(o);
       if (!b) continue;
 
       // Mai mare decat panza: translatia n-are ce rezolva, oricat ar muta. Se spune,
@@ -1139,14 +1525,26 @@ export class App {
       mutate++;
     }
     if (notes && mutate) {
-      notes.push(mutate > 1 ? mutate + ' obiecte aduse în pânză' : 'un obiect adus în pânză');
+      notes.push(mutate > 1 ? mutate + ' objects brought back into the canvas' : 'one object brought back into the canvas');
     }
     if (notes && mari) {
       notes.push(mari > 1
-        ? mari + ' figuri mai mari decât pânza: rămân întregi, se desenează micșorate'
-        : 'o figură e mai mare decât pânza: rămâne întreagă, se desenează micșorată');
+        ? mari + ' shapes larger than the canvas: they stay whole, drawn scaled down'
+        : 'a shape is larger than the canvas: it stays whole, drawn scaled down');
     }
     return mutate;
+  }
+
+  /**
+   * Gabaritul unui obiect in pixeli de canvas. Null cand n-are nimic de masurat.
+   *
+   * Figura isi da conturul; un text liber n-are contur, deci gabaritul lui sunt chiar
+   * dreptunghiurile cuvintelor lui.
+   */
+  gabaritObiect(o) {
+    return o.figure.isEmpty
+      ? App.gabaritCanvas(this.dreptunghiuriText(o))
+      : o.figure.bbox();
   }
 
   /** Gabaritul unei liste de dreptunghiuri de canvas. Null cand lista e goala. */
@@ -1159,7 +1557,35 @@ export class App {
   }
 
   /** Geometria: creare pe coordonate, sau transformare simultana a selectiei. */
-  aplicaGeom(g, notes, target) {
+  /**
+   * Un LANT de operatii de geometrie, aplicate pe rand, in ordinea din cerere.
+   *
+   * Pana acum o cerere aducea o singura operatie, iar „fa doua patrate" cerea doua
+   * prompturi — doua drumuri la model pentru ceva ce omul spusese o data. Pasii se
+   * aplica exact ca si cum ar fi fost scrisi pe rand: ce naste un pas exista pentru
+   * urmatorul. Un pas care esueaza nu-i opreste pe ceilalti; fiecare isi spune singur
+   * ce a facut, in note.
+   *
+   * Instantaneul pentru undo se ia O SINGURA DATA, in „run", inaintea intregului lant:
+   * un Undo desface cererea intreaga, nu ultimul ei pas.
+   *
+   * @returns {boolean} s-a facut cel putin un pas
+   */
+  aplicaGeoms(geoms, notes, target) {
+    const lant = geoms.length > 1;
+    if (lant) notes.push(geoms.length + ' operations in a single prompt');
+    let facut = false;
+    for (const g of geoms) facut = this.aplicaGeom(g, notes, target, lant) || facut;
+    return facut;
+  }
+
+  /**
+   * @param {boolean} [lant] operatia face parte dintr-un sir de pasi. Atunci „rect"
+   *        inseamna mereu o figura NOUA: cine insiruie pasi cere figuri, nu reformarea
+   *        celor de pe panza. Singura, aceeasi operatie pastreaza si citirea veche —
+   *        „fa-l de 200x200" pe o figura care exista.
+   */
+  aplicaGeom(g, notes, target, lant = false) {
     // PANZA insasi, nu figurile de pe ea: se schimba gabaritul zonei de desen.
     // Originea (0,0) sta in stanga jos, deci micsorarea taie spatiul de SUS si din
     // DREAPTA. Obiectele isi pastreaza coordonatele logice — are grija „setPanza" —
@@ -1167,15 +1593,15 @@ export class App {
     if (g.op === 'canvas_resize') {
       const d = this.dimensiuni(g);
       if (!d) {
-        notes.push('lipsește dimensiunea pânzei — scrie cât de mare, de exemplu „400x300”');
+        notes.push('the canvas size is missing — write how big, for example "400x300"');
         return false;
       }
       const vechi = { w: CANVAS.w, h: CANVAS.h };
       const nou = this.scena.setPanza(d.w, d.h);
       // elementul de desen NU se redimensioneaza aici: intra in scena si se animeaza
-      notes.push(`pânza ${vechi.w}×${vechi.h} → ${nou.w}×${nou.h}px`);
+      notes.push(`canvas ${vechi.w}×${vechi.h} → ${nou.w}×${nou.h}px`);
       if (nou.w !== d.w || nou.h !== d.h) {
-        notes.push(`cerut ${d.w}×${d.h}, plafonat la ${PANZA_MIN}..${CANVAS_PX}px pe latură`);
+        notes.push(`requested ${d.w}×${d.h}, capped to ${PANZA_MIN}..${PANZA_MAX}px per side`);
       }
       // Scena urmeaza panza, proportional. Restrangerea ramane doar ca plasa — si
       // fara respiro, ca sa nu strice proportia tocmai calculata.
@@ -1186,7 +1612,7 @@ export class App {
 
     if (g.op === 'clear') {
       this.scena.clear(); this.selectie.clear();
-      notes.push('scena golită');
+      notes.push('scene cleared');
       return true;
     }
 
@@ -1196,37 +1622,48 @@ export class App {
     const celule = cerute.filter(c => inCanvas(c.x, c.y));
 
     // Un punct cerut, dar in afara panzei. Validatorul de pe server tine coordonatele
-    // in 0..800 — el nu stie cat e panza ACUM — deci pe una micsorata poate ajunge aici
+    // in 0..PANZA_MAX — el nu stie cat e panza ACUM — deci pe una mai mica poate ajunge aici
     // un (400,400) care nu mai exista. Fara oprirea asta, cererea cadea mai jos si
     // „fa un patrat la 400,400" ajungea sa RESCRIE figurile selectate, in loc sa creeze
     // una noua: pare ca s-a intamplat altceva, fara sa spuna nimeni de ce.
     if (cerute.length && !celule.length) {
-      notes.push(`punctul cerut e în afara pânzei de ${CANVAS.w}×${CANVAS.h}px`);
+      notes.push(`the requested point is outside the ${CANVAS.w}×${CANVAS.h}px canvas`);
       return false;
     }
 
+    // Intr-un lant, „rect" e o CREARE, nu o reformare a ce era pe panza.
+    const faceFigura = lant && g.op === 'rect';
+
     // O figura noua are nevoie de dimensiune explicita. Nu inventam una implicita:
     // mai bine refuzam si cerem marimea decat sa desenam altceva decat s-a cerut.
-    const creeazaNou = celule.length > 0 || !this.tinte(target).length;
+    const creeazaNou = celule.length > 0 || faceFigura || !this.tinte(target).length;
     if (creeazaNou && !this.dimensiuni(g)) {
-      notes.push('lipsește dimensiunea — scrie cât de mare, în pixeli, de exemplu „150x100”');
+      notes.push('the size is missing — write how big, in pixels, for example "150x100"');
       return false;
     }
+
+    // „fa doua patrate de 100" nu spune UNDE. Fara cautarea de mai jos amandoua ar cadea
+    // in centru, una peste alta: pe ecran ai vedea un singur patrat si ai crede ca al
+    // doilea pas nu s-a facut.
+    if (faceFigura && !celule.length) celule.push(this.locLiber(g));
 
     if (celule.length) {
       // O figura noua NU se preselecteaza: dupa creare, pe panza nu e nimic selectat.
       // Selectia e o alegere a omului, prin click — nu un efect secundar al desenarii.
       this.selectie.clear();
+      // Numarat INAINTE de asezare: dupa ea, fiecare figura noua sta chiar in punctul
+      // ei, deci se gasea pe sine si nota spunea „suprapuse" la fiecare creare, si pe
+      // panza goala. Cu un lant de pasi minciuna se vedea de mai multe ori pe cerere.
+      const supra = celule.filter(c => this.scena.obiecte.some(o => o.at.x === c.x && o.at.y === c.y)).length;
       for (const c of celule) this.plaseaza(g, c);
       const d = this.dimensiuni(g);
       const dim = `${d.w}x${d.h}px`;
       // dimensiunile sunt in PIXELI: "1x1" e un punct, nu o celula. Semnalam, nu blocam.
       if (d.w < 8 || d.h < 8) {
-        notes.push(`⚠ ${d.w}×${d.h}px e cât un punct — dimensiunile sunt în pixeli, o celulă are ${CELL}px`);
+        notes.push(`⚠ ${d.w}×${d.h}px is the size of a dot — sizes are in pixels, one cell is ${CELL}px`);
       }
-      const supra = celule.filter(c => this.scena.obiecte.some(o => o.at.x === c.x && o.at.y === c.y)).length;
       if (supra && g.replace !== true) notes.push(`${supra} suprapuse peste figuri existente`);
-      notes.push(`${celule.length} obiect${celule.length > 1 ? 'e' : ''} de ${dim} celule, ${g.anchor || 'centru'} la: `
+      notes.push(`${celule.length} object${celule.length > 1 ? 's' : ''} of ${dim} cells, ${g.anchor || 'centre'} at: `
                  + celule.map(c => `(${c.x},${c.y})`).join(' '));
       return true;
     }
@@ -1235,7 +1672,7 @@ export class App {
     if (!t.length) {
       const at = { x: panza.w >> 1, y: panza.h >> 1 };
       this.plaseaza(g, at);           // nici prima figura nu se preselecteaza
-      notes.push(`primul obiect, plasat în centru (${at.x},${at.y})`);
+      notes.push(`first object, placed in the centre (${at.x},${at.y})`);
       return true;
     }
 
@@ -1249,8 +1686,8 @@ export class App {
         o.figure = OPS.moveTo(this.applyGeom(o.figure, g, CANVAS), centru).reindex();
       }
     }
-    notes.push(`aplicat simultan pe ${t.length} obiect${t.length > 1 ? 'e' : ''}`);
-    if (g.op === 'move') notes.push(`mutat la (${g.at ? g.at.x + ',' + g.at.y : '?'}) prin ${g.anchor || 'centru'}`);
+    notes.push(`applied simultaneously to ${t.length} object${t.length > 1 ? 's' : ''}`);
+    if (g.op === 'move') notes.push(`moved to (${g.at ? g.at.x + ',' + g.at.y : '?'}) by ${g.anchor || 'centre'}`);
     if (g.op === 'resize') notes.push(
       g.w ? `redimensionat la ${g.w}x${g.h}px` : `scalat cu ${g.scale}×`);
     return true;
@@ -1276,21 +1713,28 @@ export class App {
                   : false;
     if (gresita) {
       $('dsl').innerHTML = '<span class="bad">⚠ ' + (doar === 'figuri'
-        ? 'gabaritul pânzei se cere în caseta din stânga'
-        : 'caseta pânzei schimbă doar gabaritul — figurile și textul se cer în dreapta')
+        ? 'the canvas size is requested in the box on the left'
+        : 'the canvas box only changes the size — shapes and text are requested on the right')
         + '</span>';
-      $('resolved').textContent = 'nimic nu s-a trimis spre model';
+      $('resolved').textContent = 'nothing was sent to the model';
       return;
     }
 
     $(cutie.camp).value = '';      // comanda a fost preluata, caseta se goleste
     const p = this.payload();
 
-    $('dsl').innerHTML = '<span class="dim">se întreabă modelul…</span>';
+    $('dsl').innerHTML = '<span class="dim">asking the model…</span>';
     $(cutie.buton).disabled = true;
     let dsl;
-    try { dsl = await parseRemote(prompt, p, doar); }
+    try { dsl = await parseRemote(prompt, p, doar, await this.jeton()); }
     finally { $(cutie.buton).disabled = false; }
+
+    // Jetonul a expirat intre doua cereri, sau sesiunea a fost inchisa din alt tab.
+    // Pagina asta nu mai are ce cauta aici, iar rezerva locala pe regex n-are voie sa
+    // acopere asta: ar arata ca aplicatia merge, cand de fapt nu mai are cont.
+    if (dsl._cod === 401) {
+      return this.cont ? this.cont.mergiLa(this.cont.porturi.poarta) : undefined;
+    }
 
     $('srcBadge').textContent = dsl._src || '—';
     $('srcBadge').className = 'badge ' + (dsl._live ? 'live' : 'fallback');
@@ -1300,10 +1744,10 @@ export class App {
       // mult mai putin. Fara precizarea asta pare ca promptul e de vina, si omul il
       // rescrie degeaba: adevarata cauza e ca modelul n-a fost intrebat.
       const cauza = dsl._live === false && dsl._why
-        ? `<span class="dim"> — modelul n-a răspuns (${dsl._why}), a citit rezerva locală</span>`
+        ? `<span class="dim"> — the model did not answer (${dsl._why}), the local fallback read it</span>`
         : '';
       $('dsl').innerHTML = `<span class="bad">⚠ ${dsl.error}</span>${cauza}`;
-      $('resolved').textContent = dsl._why ? 'model indisponibil: ' + dsl._why : '';
+      $('resolved').textContent = dsl._why ? 'model unavailable: ' + dsl._why : '';
       return;
     }
 
@@ -1312,14 +1756,17 @@ export class App {
     // regula ca la agenti — geometrul nu are cod care sa citeasca text, nu doar
     // instructiunea sa n-o faca. Se spune insa pe fata ce s-a ignorat, ca sa nu para
     // ca nu s-a intamplat nimic.
-    const eDePanza = dsl.geom && dsl.geom.op === 'canvas_resize';
-    const strain = doar === 'panza' ? (dsl.geom && !eDePanza) || Boolean(dsl.text)
+    // O cerere poate insirui mai multi pasi de geometrie: de aici incolo sunt mereu o
+    // lista, si cand e unul singur.
+    const geoms = App.operatii(dsl.geom);
+    const eDePanza = geoms.some(g => g.op === 'canvas_resize');
+    const strain = doar === 'panza' ? geoms.some(g => g.op !== 'canvas_resize') || Boolean(dsl.text)
                  : doar === 'figuri' ? eDePanza
                  : false;
     if (strain) {
       const unde = doar === 'panza'
-        ? 'caseta pânzei schimbă doar gabaritul ei — figurile și textul se cer în dreapta'
-        : 'gabaritul pânzei se cere în caseta din stânga';
+        ? 'the canvas box only changes its own size — shapes and text are requested on the right'
+        : 'the canvas size is requested in the box on the left';
       $('dsl').innerHTML = `<span class="bad">⚠ ${unde}</span>`;
       $('resolved').textContent = 'ignorat: ' + JSON.stringify({ geom: dsl.geom, text: dsl.text });
       return;
@@ -1337,9 +1784,9 @@ export class App {
       if (auText && !cere) {
         dsl.text = { ...dsl.text, add: dsl.text.set };
         delete dsl.text.set;
-        notes.push('text adăugat lângă cel existent, nu peste el');
+        notes.push('text added next to the existing one, not over it');
       } else if (auText) {
-        notes.push('text înlocuit, nu adăugat');
+        notes.push('text replaced, not added');
       }
     }
 
@@ -1348,15 +1795,15 @@ export class App {
       const local = this.tintaDinPrompt(prompt);
       if (local) {
         dsl.target = local;
-        notes.push(`țintă dedusă local: ${local.join(', ')}`);
+        notes.push(`target inferred locally: ${local.join(', ')}`);
       }
     }
 
     // Obiectele de dinainte, retinute ca REFERINTE: asa stim exact care s-au nascut in
     // turul asta, fara sa ne bazam pe faptul ca o figura noua ramane selectata.
     const inainte = this.scena.obiecte.slice();
-    if (dsl.geom) {
-      const facut = this.aplicaGeom(dsl.geom, notes, dsl.target);
+    if (geoms.length) {
+      const facut = this.aplicaGeoms(geoms, notes, dsl.target);
 
       // Verificarea de cadru, dupa ORICE operatie de geometrie: creare pe margine,
       // marire, mutare sau taiere. Pana acum o figura putea ramane pe jumatate in
@@ -1366,7 +1813,7 @@ export class App {
       //
       // Redimensionarea panzei si-a facut deja restrangerea, cu alt respiro (zero),
       // ca sa nu strice proportia calculata acolo. Aici respiroul obisnuit e bun.
-      if (facut && dsl.geom.op !== 'canvas_resize') this.restrangeToate(notes);
+      if (facut && geoms.some(g => g.op !== 'canvas_resize')) this.restrangeToate(notes);
 
       // Dupa ORICE operatie de geometrie — scalare, taiere, mutare, redimensionarea
       // panzei — centrele s-au mutat. Vectorul se reface ACUM, nu la urmatoarea
@@ -1397,23 +1844,31 @@ export class App {
             const c = this.figuri()[nr].centru;
             dsl.text = { ...dsl.text, to: nr };
             dsl.target = null;
-            notes.push(`destinație dedusă local: figura #${nr}, centrul @${c.x},${c.y}`);
+            notes.push(`destination inferred locally: shape #${nr}, centre @${c.x},${c.y}`);
           }
         }
       }
 
-      // Cand aceeasi cerere creeaza o figura SI scrie in ea, tinta numita de agentul
-      // de text priveste numerotarea de DINAINTE de creare: figura noua inca nu exista
-      // cand a raspuns el. Textul apartine figurii tocmai create.
+      // Cand aceeasi cerere creeaza o figura SI cere ceva despre text, tinta numita de
+      // agentul de text priveste numerotarea de DINAINTE de creare: figura noua inca nu
+      // exista cand a raspuns el. De aceea tinta se sterge — altfel comanda ar cadea pe
+      // o figura veche, nimerita din numarul cu care s-a schimbat locul.
       //
-      // Legatura mergea prin selectie, cat timp o figura noua se selecta automat. Acum
-      // nu se mai preselecteaza nimic, deci figura tocmai creata se numeste pe fata.
-      const fortate = create.length && !Number.isInteger(dsl.text.to) ? create : null;
-      if (fortate) {
+      // Textul NOU nu se lipeste insa de figura tocmai nascuta: e obiect al lui, in
+      // mijlocul panzei, ca orice text nou. Doar o comanda care REASEAZA textul —
+      // o legare, o marime, o caseta — cade pe figura creata acum, fiindca despre ea
+      // vorbea cererea si alta tinta nu mai are.
+      const aduceCuvinte = (Array.isArray(dsl.text.set) && dsl.text.set.length > 0)
+                        || (Array.isArray(dsl.text.add) && dsl.text.add.length > 0);
+      let fortate = null;
+      let textNou = false;         // cuvintele aduse acum isi fac obiectul lor, in mijloc
+      if (create.length && !Number.isInteger(dsl.text.to)) {
         if (Array.isArray(dsl.target) && dsl.target.length) {
-          notes.push('textul merge pe figura nou creată, nu pe ținta dinainte');
+          notes.push('the target from before the creation is no longer valid');
         }
         dsl.target = null;
+        if (aduceCuvinte && !cerePeFigura(prompt)) textNou = true;
+        else fortate = create;
       }
 
       let t = fortate || this.tinte(dsl.target);
@@ -1421,7 +1876,7 @@ export class App {
         // nota o pune `mutaText`: doar el stie daca s-a transferat ceva sau doar s-a reasezat
         const vizate = this.tinteText(dsl.target, dsl.text.words);
         const dest = this.mutaText(vizate, dsl.text.to, dsl.text, notes);
-        if (!dest) notes.push('destinație inexistentă');
+        if (!dest) notes.push('no such destination');
         t = vizate.map(v => v.o);
       } else {
         // Textul apartine unei figuri, dar pe panza goala nu e nici una de care sa
@@ -1452,17 +1907,29 @@ export class App {
         //
         // Exceptia e cererea care spune pe fata „in fiecare", „pe toate": acolo
         // copierea chiar s-a cerut, iar promptul agentilor le cere sa NU tinteasca.
+        //
+        // Si, mai nou, asta e regula si cand pe panza e o SINGURA figura goala. Textul
+        // cadea atunci inauntrul ei, fiindca era singura tinta implicita — dar un text
+        // nou nu e al figurii care se intampla sa fie desenata, e al panzei: se aseaza
+        // in mijlocul ei, la gabaritul de ACUM, si ramane obiect de sine statator, cu
+        // numarul lui. Cine il vrea inauntru o poate cere pe fata („in patrat", „pe
+        // latura de sus"), poate numi figura, sau poate da click pe ea inainte.
         const faraTinta = !(Array.isArray(dsl.target) && dsl.target.length) && !this.selectie.size;
         const doarLibere = t.length > 0 && t.every(o => o.figure.isEmpty);
         const areDejaText = t.length > 0 && t.every(o => o.stream.words.length);
-        const singur = cuvinteNoi && (doarLibere
-          || (faraTinta && !this.cereToate(prompt) && (t.length > 1 || areDejaText)));
+        const singur = textNou || (cuvinteNoi && (doarLibere
+          || (faraTinta && !this.cereToate(prompt)
+              && (t.length > 1 || areDejaText || !cerePeFigura(prompt)))));
 
         if (!t.length || singur) {
           if (singur && !doarLibere) {
-            notes.push(areDejaText && t.length === 1
-              ? 'text nou, separat — nu se scrie peste cel existent; numește figura sau dă click pe ea ca să-l adaugi acolo'
-              : 'un singur text, nu câte unul în fiecare figură — numește figura sau dă click pe ea');
+            notes.push(textNou
+              ? 'new text, in the middle of the canvas — not in the shape just created'
+              : areDejaText && t.length === 1
+                ? 'new separate text — it does not overwrite the existing one; name the shape or click it to add it there'
+                : t.length > 1
+                  ? 'a single text, not one per shape — name the shape or click it'
+                  : 'new text, in the middle of the canvas — name the shape or click it to write inside it');
           }
           const cerere = adauga && singur
             ? { ...dsl.text, set: dsl.text.add, add: undefined }
@@ -1482,7 +1949,7 @@ export class App {
           t = vizate.map(v => v.o);
         }
       }
-      notes.push(`text pe ${t.length} obiect${t.length > 1 ? 'e' : ''}` + (Array.isArray(dsl.target) && dsl.target.length ? ` (țintit: ${dsl.target.join(', ')})` : ''));
+      notes.push(`text on ${t.length} object${t.length > 1 ? 's' : ''}` + (Array.isArray(dsl.target) && dsl.target.length ? ` (targeted: ${dsl.target.join(', ')})` : ''));
     }
 
     this.draw();
@@ -1490,13 +1957,13 @@ export class App {
     const shown = { geom: dsl.geom, text: dsl.text };
     if (dsl.why) shown.why = dsl.why;
     $('dsl').textContent = JSON.stringify(shown);
-    if (dsl._why && !dsl._live) notes.push('model indisponibil, s-a folosit parserul local');
+    if (dsl._why && !dsl._live) notes.push('model unavailable, the local parser was used');
     $('resolved').textContent = notes.join(' · ');
 
     const ok = this.scena.obiecte.every(o => o.figure.totalLength() > 0);
     $('invCheck').innerHTML = ok
-      ? '<span class="ok">fiecare obiect își păstrează Σ len</span>'
-      : '<span class="bad">un obiect a rămas fără lungime</span>';
+      ? '<span class="ok">every object keeps its own Σ len</span>'
+      : '<span class="bad">an object was left with no length</span>';
 
     this.inspect();
     this.meter(prompt, shown, dsl._usage);
@@ -1523,9 +1990,8 @@ export class App {
    * @param {boolean} gratis turul n-a costat nimic (memorie sau rezerva locala)
    */
   convoMeter(prompt, dslStr, real, gratis) {
-    const est = t => Math.ceil((t || '').length / 4);
     const masurat = Boolean(real) && !gratis;
-    const inTok = masurat ? real.in : (gratis ? 0 : (this.convo.sys || 400) + est(prompt));
+    const inTok = masurat ? real.in : (gratis ? 0 : (this.convo.sys || SYS_ESTIMAT) + est(prompt));
     const outTok = masurat ? real.out : (gratis ? 0 : est(dslStr));
     if (masurat && real.in && !this.convo.sys) this.convo.sys = real.in - est(prompt);
 
@@ -1533,15 +1999,15 @@ export class App {
     c.turns++; c.inTot += inTok; c.outTot += outTok;
     c.hist.push(est(prompt) + outTok);
 
-    const sys = c.sys || 400;
+    const sys = c.sys || SYS_ESTIMAT;
     const cuIstoric = sys * c.turns + c.hist.reduce((a, v, i) => a + v * (c.hist.length - i), 0);
     const flat = c.inTot + c.outTot;
 
     // Spunem si DE UNDE vine cifra. Fara asta, un zero pare o defectiune si o estimare
     // pare o masuratoare — exact confuzia care facea doua tururi identice sa arate diferit.
-    const sursa = gratis ? '<span class="dim"> · 0 real, din memorie sau rezervă</span>'
+    const sursa = gratis ? '<span class="dim"> · 0 real, from memory or fallback</span>'
                 : masurat ? ''
-                : '<span class="dim"> · estimat, modelul n-a fost întrebat</span>';
+                : '<span class="dim"> · estimated, the model was not asked</span>';
 
     $('convoTurns').textContent = c.turns;
     $('convoNow').innerHTML = (inTok + outTok) + sursa;
@@ -1553,10 +2019,10 @@ export class App {
 
   meter(prompt, dsl, real) {
     const p = this.payload();
-    const summary = p.noduri.map(n => `${n.nume} ${n.cod} @${n.at.x},${n.at.y}`).join('; ') || 'scenă goală';
+    const summary = p.noduri.map(n => `${n.nume} ${n.cod} @${n.at.x},${n.at.y}`).join('; ') || 'empty scene';
     const c = compare({ prompt, skeleton: this.skeleton, flat: this.flat, summary, dsl,
                         scene: this.scene, canvas: CANVAS });
-    if (real && (real.in || real.out)) c.tree = { in: real.in, out: real.out, label: 'Noduri + scenă · REAL' };
+    if (real && (real.in || real.out)) c.tree = { in: real.in, out: real.out, label: 'Nodes + scene · REAL' };
 
     const base = c.tree.in + c.tree.out;
     $('tokenBody').innerHTML = ['tree', 'flat', 'vision'].map(k => {

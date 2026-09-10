@@ -1,18 +1,27 @@
-// routing/Router.js — dispecerul.
+// mastra/router.ts — dispecerul. Ramane exact ce era: local, zero tokeni, zero apeluri.
 //
-// Clasificare pur locala, prin cuvinte-cheie: zero tokeni, zero milisecunde, niciun
-// apel la model. Decide doua lucruri deodata — ce agenti sunt chemati si ce ramuri
-// din promptul fiecaruia pleaca efectiv.
+// E singura parte a lantului pe care migrarea NU o atinge, si dinadins. Un router pe
+// model ar costa un apel intreg ca sa afle ce se vede din cuvinte, iar decizia lui ar
+// veni dupa 700 ms in loc de 0. Aici clasificarea e prin cuvinte-cheie si decide doua
+// lucruri deodata — ce agenti sunt chemati si ce ramuri din promptul fiecaruia pleaca
+// efectiv pe fir.
 //
-// Nu cunoaste agentii pe nume: se uita ce ramuri detine fiecare. Un agent nou nu
-// cere nicio modificare aici, doar isi declara ramurile.
+// Nu cunoaste agentii pe nume: se uita ce ramuri declara fiecare. Un agent nou nu cere
+// nicio modificare aici, doar isi declara ramurile.
 
-import { norm } from '../base/valori.js';
+import { norm } from './valori.js';
 
-// Tiparele trebuie sa fie SPECIFICE: un cuvant care apare in cereri de mai multe
-// feluri atrage inutil o sectiune intreaga, adica sute de tokeni la fiecare apel.
-// De aceea verbele care se refera si la figuri si la text ("muta", "mareste") au o
-// exceptie cand sunt urmate de un cuvant despre text.
+/** Ce ii trebuie routerului de la un agent. Mai mult nu se uita. */
+export interface Dispecerabil {
+  domeniu: string;
+  readonly numeRamuri: string[];
+  maPriveste(sectiuni: string[]): boolean;
+}
+
+// Tiparele trebuie sa fie SPECIFICE: un cuvant care apare in cereri de mai multe feluri
+// atrage inutil o sectiune intreaga, adica sute de tokeni la fiecare apel. De aceea
+// verbele care se refera si la figuri si la text ("muta", "mareste") au o exceptie cand
+// sunt urmate de un cuvant despre text.
 /** Substantivele care spun „cererea asta e despre scris". Se potrivesc ca prefixe. */
 const DESPRE_SCRIS = String.raw`(?:text|scris|cuvint|cuvant|cuvinte|caset|chenar|casut)`;
 
@@ -50,9 +59,9 @@ const NU_TEXT = String.raw`(?!\w*\s+(?:` + CANTITATE + String.raw`)?` + DESPRE_S
 const NU_TEXT_PANZA = String.raw`(?!\w*\s+(?:` + CANTITATE + String.raw`)?(?:`
   + DESPRE_SCRIS + '|' + DESPRE_PANZA + String.raw`))`;
 
-// „o caseta de 300 pe 80" da si ea doua dimensiuni, dar nu cere nicio figura:
-// cifrele sunt ale casetei de text. Fara exceptia asta, cererea platea degeaba si
-// promptul geometrului, iar un model slab chiar desena un dreptunghi de 300x80.
+// „o caseta de 300 pe 80" da si ea doua dimensiuni, dar nu cere nicio figura: cifrele
+// sunt ale casetei de text. Fara exceptia asta, cererea platea degeaba si promptul
+// geometrului, iar un model slab chiar desena un dreptunghi de 300x80.
 const NU_CASETA = String.raw`(?<!(caset|chenar|casut)\w*\s+(de\s+)?)`;
 
 // Nici cifrele PANZEI nu cer o figura: „micsoreaza panza la 250 pe 100" da doua
@@ -80,12 +89,12 @@ const RUTE = [
     + String.raw`|\b(pe latura|pe laturi|laturile|muchi|colt|colturi|in mijloc|in figura|inauntru|in fiecare|fiecarui|fiecarei|fiecare piesa|fiecare dreptunghi|deasupra|dedesubt|sub latura|pe contur|de-a lungul|in punctul|primele|ultimul cuvant|ascunde)`
     + String.raw`|\bmuta\w*\s+(?:` + CANTITATE + String.raw`)?` + DESPRE_SCRIS) },
 
-  // Caseta de text. Ramura proprie, deci se plateste doar cand se cere: cuvintele
-  // astea nu mai trag dupa ele documentatia celor opt legari ale tipografului.
+  // Caseta de text. Ramura proprie, deci se plateste doar cand se cere: cuvintele astea
+  // nu mai trag dupa ele documentatia celor opt legari ale tipografului.
   { nume: 'caseta', re: /\bcaset|\bchenar|\bcasut|\btext ?box|ca un paragraf/ },
 
-  // PANZA insasi, nu figurile de pe ea. Ramura ei, ca la caseta: „micsoreaza panza"
-  // nu mai plateste operatiile pe figuri, iar „imparte figura 0 in 3" nu mai plateste
+  // PANZA insasi, nu figurile de pe ea. Ramura ei, ca la caseta: „micsoreaza panza" nu
+  // mai plateste operatiile pe figuri, iar „imparte figura 0 in 3" nu mai plateste
   // documentatia panzei — cea care urcase ramura „modifica" de la 667 la 719 tokeni.
   { nume: 'panza', re: PANZA_LARG },
 
@@ -94,15 +103,17 @@ const RUTE = [
   { nume: 'modifica', re: new RegExp(String.raw`\b(muta|mareste|micsorea)` + NU_TEXT_PANZA + String.raw`\b|\b(mutare|deplas|imparte|impart|taie|split|redimension|scade|clear|goleste|jumatate|dublu|mai mare|mai mic|interiorul(?!\s+fiecar)|inlocui)`) },
 ];
 
-// Verbe care se potrivesc si figurilor si textului. Daca apar FARA un substantiv
-// care sa lamureasca despre ce e vorba, routerul nu ghiceste.
+// Verbe care se potrivesc si figurilor si textului. Daca apar FARA un substantiv care
+// sa lamureasca despre ce e vorba, routerul nu ghiceste.
 const AMBIGUU = /\b(mareste|micsorea|muta|scade|redimension|mai mare|mai mic|dublu|jumatate)/;
 const DESPRE_FIGURA = /\b(figur|dreptunghi|patrat|forma|obiect)/;
 const DESPRE_TEXT = /\b(text|scris|cuvint|cuvant|cuvinte|font|caset|chenar|casut)/;
 
-export class Router {
-  /** @param {import('../base/Agent.js').Agent[]} agenti echipa pe care o dispeceaza */
-  constructor(agenti) {
+export class Router<A extends Dispecerabil = Dispecerabil> {
+  agenti: A[];
+
+  /** @param agenti echipa pe care o dispeceaza */
+  constructor(agenti: A[]) {
     this.agenti = agenti;
   }
 
@@ -115,12 +126,12 @@ export class Router {
    * Ce sectiuni de prompt are nevoie cererea asta.
    * Daca nu se potriveste nimic, le trimitem pe toate — mai bine scump decat gresit.
    */
-  sectiuni(prompt, doar) {
+  sectiuni(prompt: string, doar?: string): string[] {
     // Interfata are DOUA casete de comanda: una doar pentru panza, alta pentru figuri
     // si text. Care caseta a fost folosita e un semnal de rutare pe care il da OMUL,
     // gratis — si e fara echivoc, spre deosebire de cuvinte: „mareste" scris in caseta
-    // panzei nu mai poate fi citit ca o marire de figura. Cand semnalul exista,
-    // routerul nu mai are ce ghici.
+    // panzei nu mai poate fi citit ca o marire de figura. Cand semnalul exista, routerul
+    // nu mai are ce ghici.
     if (doar === 'panza') return ['panza'];
 
     const p = norm(prompt);
@@ -129,20 +140,20 @@ export class Router {
     // caseta figurilor nu plateste niciodata documentatia panzei
     if (doar === 'figuri') alese = alese.filter(r => r !== 'panza');
 
-    // NU_TEXT se uita doar la cuvantul de langa verb. In „mareste cu 100 de pixeli
-    // pe lungime si latime textboxul" substantivul sta la capatul frazei, deci
-    // exceptia nu-l vede si ramura de geometrie se aprindea degeaba — iar geometrul
-    // chemat pe o cerere de text raspunde ce stie el: redimensioneaza figura.
-    // Regula e aceeasi ca la `alege`: daca se vorbeste despre text sau caseta si
-    // despre nicio figura, geometria n-are ce cauta in cerere.
+    // NU_TEXT se uita doar la cuvantul de langa verb. In „mareste cu 100 de pixeli pe
+    // lungime si latime textboxul" substantivul sta la capatul frazei, deci exceptia
+    // nu-l vede si ramura de geometrie se aprindea degeaba — iar geometrul chemat pe o
+    // cerere de text raspunde ce stie el: redimensioneaza figura. Regula e aceeasi ca la
+    // `alege`: daca se vorbeste despre text sau caseta si despre nicio figura, geometria
+    // n-are ce cauta in cerere.
     if (DESPRE_TEXT.test(p) && !DESPRE_FIGURA.test(p)) {
       alese = alese.filter(r => r !== 'creare' && r !== 'modifica');
     }
 
     // Aceeasi regula pentru PANZA: cand cererea vorbeste despre ea si despre nicio
     // figura, operatiile pe figuri n-au ce cauta. „fa panza 400 pe 400" incepe cu un
-    // verb de creare, dar nu creeaza nicio figura — fara filtrul asta platea si
-    // ramura de creare, iar un model slab chiar desena un dreptunghi de 400x400.
+    // verb de creare, dar nu creeaza nicio figura — fara filtrul asta platea si ramura
+    // de creare, iar un model slab chiar desena un dreptunghi de 400x400.
     if (PANZA_STRICT.test(p) && !DESPRE_FIGURA.test(p)) {
       alese = alese.filter(r => r !== 'creare' && r !== 'modifica');
     }
@@ -154,11 +165,11 @@ export class Router {
   /**
    * Ce agenti sunt chemati.
    *
-   * Cand verbul e ambiguu si nimic din cerere nu lamureste despre ce e vorba, ii
-   * cheama pe toti: fiecare raspunde pentru domeniul lui si rezultatele se combina.
-   * Costa mai mult decat o ghiceala, dar o ghiceala gresita costa un tur intreg.
+   * Cand verbul e ambiguu si nimic din cerere nu lamureste despre ce e vorba, ii cheama
+   * pe toti: fiecare raspunde pentru domeniul lui si rezultatele se combina. Costa mai
+   * mult decat o ghiceala, dar o ghiceala gresita costa un tur intreg.
    */
-  alege(prompt, doar) {
+  alege(prompt: string, doar?: string): A[] {
     // Caseta panzei cheama exact agentul care detine ramura ei — gasit tot dupa ramuri,
     // nu dupa nume: routerul nu-i cunoaste pe agenti pe nume, nici aici.
     if (doar === 'panza') {

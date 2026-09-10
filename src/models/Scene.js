@@ -5,7 +5,7 @@
 //
 // SISTEMUL DE COORDONATE
 //   Grila are celule de cate 50 px; panza porneste la 800x800, dar gabaritul ei se
-//   poate schimba din prompt (vezi setPanza), intre 50 si 800 px pe latura.
+//   poate schimba din prompt (vezi setPanza), intre 50 si 1200 px pe latura.
 //   Originea (0,0) e in coltul din STANGA JOS, iar y creste in SUS — ca la matematica.
 //   Canvas-ul are y-ul invers (creste in jos), asa ca toate conversiile trec prin
 //   pointPixel / toLogic. Nimic altundeva in cod nu are voie sa presupuna sensul lui y.
@@ -13,9 +13,29 @@
 // INVARIANTUL ramane per obiect: fiecare obiect isi conserva propriul Sum(len).
 // Doua obiecte diferite au bugete independente.
 
+import { Figure } from './Figure.js';
+
 export const GRID = 16;
 export const CELL = 50;
-export const CANVAS_PX = GRID * CELL;         // 800 — gabaritul maxim, si cel de pornire
+
+/**
+ * Panza de PORNIRE, in pixeli: 16 celule de cate 50.
+ *
+ * A fost multa vreme si plafonul, iar cele doua stateau in aceeasi constanta — pana
+ * cand plafonul a urcat la 1200 si s-a vazut ca nu inseamna acelasi lucru. Cat porneste
+ * panza e o alegere de comoditate: atat incape comod in pagina si atat descrie promptul
+ * de sistem. Cat poate creste e cu totul altceva, si scrie mai jos.
+ */
+export const CANVAS_PX = GRID * CELL;
+
+/**
+ * Cat poate creste panza, pe fiecare latura.
+ *
+ * Peste atat nu se mai trece: elementul de desen ar depasi coloana lui din pagina, iar
+ * catalogul de figuri — care masoara gabaritele in celule — n-ar mai avea cod pentru ce
+ * e mai mare. Cine cere mai mult primeste plafonul, si i se spune.
+ */
+export const PANZA_MAX = 1200;
 
 /**
  * Gabaritul CURENT al panzei, in pixeli.
@@ -27,17 +47,17 @@ export const CANVAS_PX = GRID * CELL;         // 800 — gabaritul maxim, si cel
  */
 export const panza = { w: CANVAS_PX, h: CANVAS_PX };
 
-/** Sub o celula de grila n-ar mai incapea nimic; peste CANVAS_PX n-ar incapea in pagina. */
+/** Sub o celula de grila n-ar mai incapea nimic; peste PANZA_MAX n-ar incapea in pagina. */
 export const PANZA_MIN = CELL;
 
 /** O latura de panza, tinuta intre cat are rost si cat incape. */
-export const limPanza = v => Math.max(PANZA_MIN, Math.min(CANVAS_PX, Math.round(Number(v) || 0)));
+export const limPanza = v => Math.max(PANZA_MIN, Math.min(PANZA_MAX, Math.round(Number(v) || 0)));
 
 /**
  * Marginile din jurul zonei de desen, in pixeli.
  * Stanga si jos tin cifrele axelor; dreapta si sus exista ca ultima eticheta sa
  * nu fie taiata. Contextul e translatat cu (l, t) — restul codului lucreaza in
- * coordonate 0..CANVAS_PX.
+ * coordonate 0..latura panzei de acum.
  */
 export const AX = { l: 34, r: 22, t: 12, b: 30 };
 
@@ -79,6 +99,77 @@ let _id = 0;
  */
 let _text = 0;
 export const nextText = () => ++_text;
+
+// ─────────────────────────────────────────────── scena ca DATE, pentru salvare
+//
+// `snapshot` si `toJSON` seamana, dar nu sunt acelasi lucru si nu se pot inlocui.
+// Instantaneul e pentru Undo: ramane in memorie, deci poate purta obiecte vii —
+// `Figure`, cu metodele ei. Forma de mai jos pleaca intr-o coloana de baza de date si
+// se intoarce peste zile, poate in alta sesiune, asa ca n-are voie sa contina decat
+// numere, siruri si liste.
+//
+// Diferenta se vede cel mai bine la panza: `snapshot` o pune ca PROPRIETATE pe lista,
+// iar `JSON.stringify` a unei liste nu scrie decat elementele indexate — gabaritul s-ar
+// pierde in tacere, si o scena salvata pe o panza de 400x300 s-ar intoarce pe una de
+// 800x800, cu tot ce era in dreapta ei in afara cadrului.
+
+/** Versiunea formei salvate. Creste doar cand un camp isi schimba INTELESUL. */
+export const FORMAT = 1;
+
+/** Cate legari cunoaste motorul. Ce nu e aici nu se poate desena, deci nu se citeste. */
+const MODURI = new Set(['inside', 'pieces', 'path', 'sides', 'side',
+                        'corners', 'corner', 'point', 'box', 'none']);
+
+const numar = (v, implicit = 0) => (Number.isFinite(Number(v)) ? Number(v) : implicit);
+
+/** Un punct citit din date STRAINE; null cand nu e unul. */
+const punctJSON = q => (q && typeof q === 'object'
+  && Number.isFinite(Number(q.x)) && Number.isFinite(Number(q.y))
+  ? { x: Number(q.x), y: Number(q.y) }
+  : null);
+
+/**
+ * O legare, in forma in care se poate scrie si citi la loc.
+ *
+ * Sirul ramane sir: „inside" e cea mai deasa legare de pe scena si n-are rost umflata
+ * intr-un obiect. Restul se taie la campurile pe care le cunoaste `layout` — ce n-are
+ * cine desena n-are de ce sa ocupe loc in baza de date.
+ */
+const legareJSON = b => {
+  if (typeof b === 'string') return MODURI.has(b) ? b : 'inside';
+  if (!b || typeof b !== 'object' || !MODURI.has(b.bind)) return 'inside';
+  const out = { bind: b.bind };
+  // `at` e un PUNCT la 'point' si la 'box', dar un NUME de latura sau de colt la
+  // 'side' si 'corner'. Amandoua sunt legitime, deci amandoua se pastreaza.
+  if (typeof b.at === 'string') out.at = b.at;
+  else if (punctJSON(b.at)) out.at = punctJSON(b.at);
+  if (b.in === true) out.in = true;
+  if (Number.isFinite(Number(b.rot)) && Number(b.rot)) out.rot = Number(b.rot);
+  if (Number.isFinite(Number(b.w)) && Number(b.w) > 0) out.w = Number(b.w);
+  if (Number.isFinite(Number(b.h)) && Number(b.h) > 0) out.h = Number(b.h);
+  return out;
+};
+
+/**
+ * Poliliniile unei figuri, citite din date straine.
+ *
+ * Se sare peste ce nu se poate desena — o polilinie fara origine, un segment cu
+ * lungime care nu e numar — si se pastreaza restul. E aceeasi purtare ca a cititorului
+ * de DSL din `scheme.ts`: un rand stricat nu trebuie sa arunce toata pânza.
+ */
+const poliliniiJSON = lista => {
+  const out = [];
+  for (const p of Array.isArray(lista) ? lista : []) {
+    const origin = punctJSON(p && p.origin);
+    if (!origin || !Array.isArray(p.segs)) continue;
+    const segs = p.segs
+      .filter(s => s && Number.isFinite(Number(s.len)) && Number.isFinite(Number(s.turn)))
+      .map((s, i) => ({ id: String(s.id || ('e' + i)), len: Number(s.len), turn: Number(s.turn) }));
+    if (!segs.length) continue;
+    out.push({ origin, heading: numar(p.heading), closed: p.closed !== false, segs });
+  }
+  return out;
+};
 
 /** Un obiect de pe scena: figura + textul ei + celula pe care sta. */
 export class Obiect {
@@ -222,5 +313,100 @@ export class Scene {
       o.texte = [...(s.texte || [])];
       return o;
     });
+  }
+
+  /**
+   * Scena ca DATE PURE: ce se scrie in `continut_json` si se citeste la loc.
+   *
+   * Numele campurilor sunt cele din `snapshot`, dinadins: cele doua forme se citesc
+   * una langa alta, iar cine adauga un camp la obiect vede imediat ca are doua locuri
+   * de trecut, nu unul.
+   *
+   * Ce NU se salveaza: id-urile de obiect si numerele de text. Amandoua sunt serii
+   * locale sesiunii — `o1`, `o2` din contorul modulului — iar duse dintr-o sesiune in
+   * alta s-ar ciocni cu ale obiectelor create dupa incarcare. La citire se dau altele,
+   * pastrand ORDINEA, care e singurul lucru care conteaza din ele.
+   */
+  toJSON() {
+    return {
+      v: FORMAT,
+      panza: { w: panza.w, h: panza.h },
+      obiecte: this.obiecte.map(o => ({
+        at: { x: o.at.x, y: o.at.y },
+        centru: { x: o.centru.x, y: o.centru.y },
+        figure: o.figure.polylines.map(p => ({
+          origin: { x: p.origin.x, y: p.origin.y },
+          heading: p.heading,
+          closed: Boolean(p.closed),
+          segs: p.segs.map(s => ({ id: s.id, len: s.len, turn: s.turn })),
+        })),
+        words: [...o.stream.words],
+        fontPx: o.stream.fontPx,
+        binds: o.binds.map(legareJSON),
+        texte: [...o.texte],
+      })),
+    };
+  }
+
+  /**
+   * Scena adusa inapoi din date. INLOCUIESTE tot ce era pe pânză.
+   *
+   * Datele vin din afara procesului, deci sunt tratate ca atare: nimic nu se crede pe
+   * cuvant, ce nu se poate desena se sare, si nicio forma stricata n-are voie sa arunce.
+   * Un rand corupt in baza de date trebuie sa dea o pânză mai saraca, nu o aplicatie
+   * moarta.
+   *
+   * Numerele de text se REFAC, in ordinea celor salvate: T0 ramane primul text, T1 al
+   * doilea. Numerotarea aratata e oricum pozitionala (vezi `App.ordineTexte`), deci
+   * numai ordinea trebuia pastrata, nu si cifrele.
+   *
+   * @param {object} date ce s-a citit din `continut_json`
+   * @param {(words:string[], fontPx:number) => object} faceStream fabrica de fluxuri
+   * @returns {number} cate obiecte au fost incarcate
+   */
+  incarca(date, faceStream) {
+    const d = date && typeof date === 'object' ? date : {};
+    const brute = Array.isArray(d.obiecte) ? d.obiecte : [];
+
+    // Gabaritul intai: `at` si poliliniile sunt in pixelii pânzei pe care s-a salvat,
+    // deci pânza trebuie sa fie aceea inainte ca obiectele sa se aseze pe ea.
+    const latura = v => (Number.isFinite(Number(v)) ? limPanza(v) : CANVAS_PX);
+    panza.w = latura(d.panza && d.panza.w);
+    panza.h = latura(d.panza && d.panza.h);
+
+    // vechiul numar de text -> unul nou, in ordine crescatoare, deci ordinea se pastreaza
+    const vechi = [...new Set(brute.flatMap(o => (Array.isArray(o && o.texte) ? o.texte : []))
+                                   .filter(s => Number.isFinite(Number(s)) && Number(s) > 0)
+                                   .map(Number))].sort((a, b) => a - b);
+    const serie = new Map(vechi.map(s => [s, nextText()]));
+
+    this.obiecte = [];
+    for (const b of brute) {
+      if (!b || typeof b !== 'object') continue;
+      const at = punctJSON(b.at);
+      if (!at) continue;                       // fara punct de asezare n-are unde sta
+
+      const cuvinte = (Array.isArray(b.words) ? b.words : [])
+        .filter(w => typeof w === 'string' || typeof w === 'number')
+        .map(String);
+      const figura = new Figure(poliliniiJSON(b.figure));
+      // un obiect fara contur SI fara cuvinte n-ar desena nimic: nu merita reinviat
+      if (figura.isEmpty && !cuvinte.length) continue;
+
+      const fontPx = Math.max(1, numar(b.fontPx, 17));
+      const o = new Obiect(figura, at, faceStream(cuvinte, fontPx));
+      o.centru = punctJSON(b.centru) || { x: at.x, y: at.y };
+      // cate o legare pe cuvant, ca in restul codului; ce lipseste devine 'inside'
+      const legari = Array.isArray(b.binds) ? b.binds : [];
+      o.binds = cuvinte.map((_, i) => legareJSON(legari[i] !== undefined ? legari[i] : legari[0]));
+      // Un cuvant fara numar salvat tot trebuie sa capete unul, altfel n-ar aparea in
+      // starea trimisa modelului si „textul 1" n-ar avea la ce sa se refere. Toate
+      // cele fara numar dintr-un obiect primesc ACELASI: erau un text, nu mai multe.
+      const salvate = Array.isArray(b.texte) ? b.texte : [];
+      let fara = 0;
+      o.texte = cuvinte.map((_, i) => serie.get(Number(salvate[i])) || (fara || (fara = nextText())));
+      this.obiecte.push(o);
+    }
+    return this.obiecte.length;
   }
 }

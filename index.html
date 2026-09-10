@@ -1,214 +1,123 @@
 <!DOCTYPE html>
-<html lang="ro">
+<html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Restructurare imagine+text prin catalog de atribute</title>
+<title>Sign in · Image + text restructuring</title>
 <style>
-  /* Fundal alb, scris negru. Culorile de accent sunt cele saturate, nu cele pastel:
-     pe alb un #60a5fa se pierde, iar cifrele de pe axe devin ilizibile. */
+  /* Aceeași paletă ca a aplicației (`app.html`), doar variabilele de care are nevoie
+     poarta. Se repetă dinadins: proiectul n-are pas de build și n-are niciun fișier
+     CSS, iar o pagină de autentificare care ar aștepta un al doilea fișier ar putea
+     să se arate nestilizată exact în clipa în care omul își scrie parola. */
   :root{--bg:#ffffff;--panel:#ffffff;--line:#d7dee8;--ink:#000000;
-        --dim:#55606f;--accent:#1d4ed8;--ok:#047857;--bad:#be123c;--new:#b45309;
-        --camp:#f7f9fc;--cod:#1e40af}
+        --dim:#55606f;--accent:#1d4ed8;--ok:#047857;--bad:#be123c;--camp:#f7f9fc}
   *{box-sizing:border-box}
   body{margin:0;background:var(--bg);color:var(--ink);
-       font:13px/1.5 "Segoe UI",system-ui,sans-serif;padding:20px 28px 36px}
+       font:13px/1.5 "Segoe UI",system-ui,sans-serif;
+       min-height:100vh;display:flex;align-items:center;justify-content:center;padding:24px}
 
+  .poarta{width:100%;max-width:380px}
+  h1{font-size:19px;margin:0 0 6px;font-weight:600;letter-spacing:-.01em}
+  .sub{color:var(--dim);font-size:12.5px;margin:0 0 18px;line-height:1.5}
 
-  /* stanga | canvas | dreapta */
-  /* Coloanele laterale raman la o latime lizibila, iar spatiul liber se duce
-     INTRE ele: blocurile ajung la marginile paginii, canvasul ramane exact la mijloc. */
-  .grid{display:grid;align-items:start;width:100%;gap:28px;
-        grid-template-columns:minmax(230px,320px) 944px minmax(230px,320px);
-        justify-content:space-between}
-  .col{display:flex;flex-direction:column;gap:12px;min-width:0}
-  .center{gap:12px;position:sticky;top:18px}
-  /* panza isi poate schimba gabaritul din prompt; ramane centrata in coloana ei */
-  .center canvas{align-self:center}
-
-  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
-  h2{font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);
-     margin:0 0 9px;font-weight:600}
-  .hdr{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:9px}
-  .hdr h2{margin:0}
-
-  canvas{background:#ffffff;border:1px solid var(--line);border-radius:10px;display:block}
-
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px}
+  label{display:block;font-size:10px;letter-spacing:.09em;text-transform:uppercase;
+        color:var(--dim);margin:0 0 5px;font-weight:600}
+  label + input{margin-bottom:12px}
   input{width:100%;background:var(--camp);border:1px solid var(--line);color:var(--ink);
         border-radius:8px;padding:10px 12px;font:inherit;font-size:13.5px}
   input:focus{outline:none;border-color:var(--accent)}
   button{background:#f1f4f9;border:1px solid var(--line);color:var(--ink);border-radius:7px;
-         padding:7px 12px;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}
+         padding:8px 12px;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}
   button:hover:not(:disabled){background:#e4eaf3;border-color:var(--accent)}
   button:disabled{opacity:.5;cursor:default}
-  .bar{display:flex;gap:7px;margin-top:8px}
+  #trimite{background:var(--accent);border-color:var(--accent);color:#ffffff}
+  #trimite:hover:not(:disabled){background:#1e40af;border-color:#1e40af}
+  .bar{display:flex;gap:7px;margin-top:4px}
   .bar button{flex:1}
 
-  .kv{display:flex;justify-content:space-between;gap:8px;padding:3px 0;
-      border-bottom:1px dashed var(--line);font-size:12px}
-  .kv:last-child{border:0}
-  .kv span:first-child{color:var(--dim);flex-shrink:0}
-  .kv b{text-align:right;min-width:0;overflow-wrap:anywhere}
+  /* Regulile de parolă: bifate pe măsură ce sunt îndeplinite. Verde și „✓" deodată —
+     culoarea singură n-ar spune nimic cuiva care n-o distinge. */
+  #reguli{list-style:none;margin:2px 0 10px;padding:0;font-size:11px}
+  #reguli li{color:var(--dim);padding:2px 0;display:flex;gap:6px;align-items:baseline}
+  #reguli li.da{color:var(--ok)}
+  #reguli li::before{content:"○";font-size:10px;width:11px;flex-shrink:0}
+  #reguli li.da::before{content:"✓"}
 
-  code,pre,.mono{font-family:"Cascadia Code",Consolas,monospace}
-  pre{background:var(--camp);border:1px solid var(--line);border-radius:7px;padding:8px;
-      font-size:11px;overflow:auto;margin:0;color:var(--cod);max-height:130px;white-space:pre-wrap;
-      overflow-wrap:anywhere}
-  .q{font-family:"Cascadia Code",Consolas,monospace;font-size:10.5px;color:var(--dim);
-     padding:1px 0 1px 8px;border-left:2px solid var(--line)}
-
-  table{width:100%;border-collapse:collapse;font-size:11.5px}
-  th{text-align:right;color:var(--dim);font-weight:600;font-size:9.5px;text-transform:uppercase;
-     letter-spacing:.05em;padding:4px 3px;border-bottom:1px solid var(--line)}
-  th:first-child,td:first-child{text-align:left}
-  td{padding:5px 3px;border-bottom:1px solid var(--line);text-align:right}
-  tr.win td{color:var(--ok)}
-
-  .ok{color:var(--ok)} .bad{color:var(--bad)} .dim{color:var(--dim)}
-  .path{font-family:"Cascadia Code",Consolas,monospace;font-size:16px;color:var(--accent);
-        overflow-wrap:anywhere}
-  .leaf{font-size:14px;font-weight:600}
-  .new{background:var(--new);color:#ffffff;font-size:9px;font-weight:700;
-       padding:2px 6px;border-radius:20px;letter-spacing:.04em;vertical-align:middle}
-  .chip{display:inline-block;background:var(--camp);border:1px solid var(--line);border-radius:20px;
-        padding:2px 8px;margin:2px 3px 2px 0;font-size:10.5px;
-        font-family:"Cascadia Code",Consolas,monospace;color:var(--cod)}
-  .badge{font-size:9.5px;font-family:"Cascadia Code",Consolas,monospace;padding:2px 7px;
-         border-radius:20px;border:1px solid var(--line);background:var(--camp);color:var(--dim)}
-  .badge.live{border-color:var(--ok);color:var(--ok)}
-  .badge.fallback{border-color:var(--new);color:var(--new)}
-  .note{font-size:10.5px;color:var(--dim);margin-top:5px;line-height:1.45}
-
-  /* sub ~1180px nu mai incap trei coloane cu spatiu intre ele */
-  /* sub ~1500px nu mai incap trei coloane in jurul unei panze de 800 */
-  @media (max-width:1620px){
-    .grid{grid-template-columns:minmax(240px,1fr) 944px;gap:20px;justify-content:center}
-  }
-  @media (max-width:1260px){
-    .grid{grid-template-columns:944px;justify-content:center}
-    .center{position:static;order:-1}
-  }
-  @media (max-width:860px){
-    .grid{grid-template-columns:1fr}
-    canvas{max-width:100%;height:auto}
-  }
+  a{color:var(--accent)}
+  .note{font-size:10.5px;color:var(--dim);margin-top:12px;line-height:1.5}
+  .note.bad{color:var(--bad)}
+  .note.ok{color:var(--ok)}
+  .jos{margin-top:14px;font-size:10.5px;color:var(--dim);text-align:center;line-height:1.5}
 </style>
 </head>
 <body>
 
+<main class="poarta">
+  <h1>Image + text restructuring</h1>
+  <p class="sub" id="sub">
+    Canvas drawing driven by natural language. Canvases are saved to your account,
+    so you sign in before you draw.
+  </p>
 
-<div class="grid">
-
-  <!-- ============ STANGA: comanda si ce este figura ============ -->
-  <div class="col">
-
-    <div class="panel">
-      <h2>Redimensionare pânză</h2>
-      <input id="promptPanza" autocomplete="off">
-      <div class="bar">
-        <button id="goPanza">Aplică</button>
-      </div>
-      <div class="note">
-        Doar gabaritul zonei de desen, între 50 și 800px pe latură. Ce iese din cadru
-        e adus înăuntru automat. O cerere despre figuri sau text e refuzată aici —
-        locul ei e în caseta din dreapta.
-      </div>
-    </div>
-
-    <div class="panel">
-      <h2>Clasificare · local, 0 tokeni</h2>
-      <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:8px;flex-wrap:wrap">
-        <span class="path" id="bstPath">—</span><span class="leaf" id="bstLeaf">—</span>
-      </div>
-      <div id="bstQ" style="margin-bottom:8px"></div>
-      <div class="kv"><span>cost clasificare</span><b id="bstCmp">—</b></div>
-      <div class="kv"><span>mod text</span><b id="bindMode" class="mono">—</b></div>
-      <div class="kv"><span>Σ lungimi</span><b id="invariant">—</b></div>
-      <div class="kv"><span>verificare</span><b id="invCheck">—</b></div>
-    </div>
-
-    <div class="panel">
-      <h2>Figuri învățate · <span id="learnCount">0</span> din <span id="addressable">?</span></h2>
-      <div id="learned"></div>
-      <div class="note">
-        Catalogul pornește gol. Fiecare figură nouă își primește numele dedus din
-        atribute și se înregistrează singură.
-      </div>
-    </div>
-
-    <div class="panel">
-      <div class="hdr"><h2>Nod selectat · click pe pânză</h2>
-        <button id="deselect">Deselectează</button></div>
-      <div id="selInfo" style="margin-bottom:8px;font-size:12px"></div>
-      <div class="note" style="margin:0 0 4px">ce pleacă efectiv spre API</div>
-      <pre id="payload">—</pre>
-      <div class="note" style="margin:8px 0 4px">text curent · index, cuvânt, legare</div>
-      <div id="textState"></div>
-    </div>
-
+  <!-- Cât se citește sesiunea păstrată în browser. Cine s-a autentificat data trecută
+       nu vede niciodată formularul: e dus direct în aplicație. -->
+  <div class="panel" id="asteapta">
+    <span class="dim">checking your session…</span>
   </div>
 
-  <!-- ============ CENTRU: doar pânza ============ -->
-  <!-- Singură în coloana ei: gabaritul se schimbă din prompt, iar coloana rămâne
-       fixă la 944px ca pânza să aibă loc să se micșoreze și să crească înapoi fără
-       ca restul paginii să sară de fiecare dată. -->
-  <div class="col center">
-    <canvas id="canvas"></canvas>
+  <div class="panel" id="formular" hidden>
+    <label for="email">Email</label>
+    <input id="email" type="email" autocomplete="username" autofocus>
+
+    <!-- Numele se cere DOAR la cont nou: la intrare, cheia e adresa de email, aia o
+         știe Supabase. Un câmp cerut degeaba la fiecare intrare ar fi doar de încurcat. -->
+    <div id="campNume" hidden>
+      <label for="nume">Username</label>
+      <input id="nume" autocomplete="nickname">
+    </div>
+
+    <label for="parola">Password</label>
+    <input id="parola" type="password" autocomplete="current-password">
+
+    <!-- Regulile se aprind în timp ce omul scrie. O listă statică ar spune același
+         lucru, dar n-ar arăta CÂND s-a îndeplinit fiecare. -->
+    <ul id="reguli" hidden></ul>
+
+    <div class="bar">
+      <button id="trimite">Sign in</button>
+    </div>
+    <div class="note" id="mesaj"></div>
+    <div class="note">
+      <span id="intrebare">No account?</span>
+      <a href="#" id="schimba">Create one</a>
+    </div>
   </div>
 
-  <!-- ============ DREAPTA: comanda pe obiecte si ce costa ============ -->
-  <div class="col">
-
-    <div class="panel">
-      <h2>Creare și modificare · figuri și text</h2>
-      <input id="promptFiguri" autocomplete="off">
-      <div class="bar">
-        <button id="goFiguri">Execută</button>
-        <button id="undo" title="Desface ultima schimbare, inclusiv pe cea a pânzei">Undo</button>
-      </div>
-      <div class="note">
-        Creare, mutare, tăiere, scriere, casetă de text. Gabaritul pânzei se cere în
-        caseta din stânga. <b>Undo</b> desface ultima schimbare, oricare dintre cele două.
-      </div>
+  <!-- Serverul n-are conturi configurate. Aplicația merge la fel ca înainte, doar că
+       nu salvează nimic — n-are unde. A o bloca aici ar însemna un proiect care nu
+       pornește fără o bază de date, ceea ce n-a fost niciodată cazul. -->
+  <div class="panel" id="fara" hidden>
+    <b>Accounts are not enabled on this server.</b>
+    <div class="note">
+      You can still use the app, but canvases will not be saved anywhere. Whoever
+      runs the server enables accounts by setting <code>SUPABASE_URL</code>,
+      <code>SUPABASE_ANON_KEY</code> and <code>SUPABASE_SERVICE_KEY</code> in
+      <code>.env</code>.
     </div>
-
-    <div class="panel">
-      <div class="hdr"><h2>DSL emis de model</h2><span class="badge" id="srcBadge">—</span></div>
-      <pre id="dsl">— rulează un prompt —</pre>
-      <div class="note" id="resolved"></div>
-      <div class="note">conectat la <span class="mono" id="provider">—</span></div>
+    <div class="bar" style="margin-top:10px">
+      <button id="oricum">Continue without an account</button>
     </div>
-
-    <div class="panel">
-      <h2>Cost pe conversație</h2>
-      <div class="kv"><span>turul</span><b id="convoTurns">0</b></div>
-      <div class="kv"><span>acest tur</span><b id="convoNow">—</b></div>
-      <div class="kv"><span>cumulat</span><b id="convoTotal">—</b></div>
-      <div class="kv"><span>cu istoric ar fi fost</span><b id="convoHist">—</b></div>
-      <div class="note">
-        Fiecare tur trimite instrucțiunile (constante) plus nodul și părintele lui.
-        Niciodată istoricul, deci turul 50 costă cât turul 1.
-      </div>
-    </div>
-
-    <div class="panel">
-      <h2>Cost per apel · schelet de <span id="skelSize">?</span> întrebări</h2>
-      <table>
-        <thead><tr><th>Strategie</th><th>in</th><th>out</th><th>total</th><th>×</th></tr></thead>
-        <tbody id="tokenBody"><tr><td colspan="5" style="text-align:left;color:var(--dim)">—</td></tr></tbody>
-      </table>
-      <div class="note" style="margin:9px 0 4px">output-ul real al modelului</div>
-      <pre id="dslOut">—</pre>
-      <div class="note" style="margin:8px 0 4px">ce ar fi trimis varianta vision</div>
-      <pre id="coordsOut">—</pre>
-    </div>
-
   </div>
-</div>
+
+  <div class="jos">
+    Your canvases are visible only to you.
+  </div>
+</main>
 
 <script type="module">
-  import { App } from './src/core/App.js';
-  new App();
+  import { Autentificare } from './src/cont/Autentificare.js';
+  new Autentificare();
 </script>
 </body>
 </html>

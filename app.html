@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Image + text restructuring via attribute catalog</title>
+<style>
+  /* Fundal alb, scris negru. Culorile de accent sunt cele saturate, nu cele pastel:
+     pe alb un #60a5fa se pierde, iar cifrele de pe axe devin ilizibile. */
+  :root{--bg:#ffffff;--panel:#ffffff;--line:#d7dee8;--ink:#000000;
+        --dim:#55606f;--accent:#1d4ed8;--ok:#047857;--bad:#be123c;--new:#b45309;
+        --camp:#f7f9fc;--cod:#1e40af}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:13px/1.5 "Segoe UI",system-ui,sans-serif;padding:20px 28px 36px}
+
+
+  /* stanga | canvas | dreapta */
+  /* Coloanele laterale raman la o latime lizibila, iar spatiul liber se duce
+     INTRE ele: blocurile ajung la marginile paginii, canvasul ramane exact la mijloc. */
+  /* Coloana din mijloc: 944px cat timp pânza e cea de pornire, si creste odata cu ea
+     pana la 1256 (1200 de desen + 56 de axe) cand e ceruta mai mare. Minimul fix e
+     cel care tine pagina sa nu sara la fiecare micsorare a pânzei; `max-content` e
+     cel care lasa o pânza de 1200 sa incapa in loc sa dea peste coloana vecina.
+     Intre cele doua, grila strange coloana cat ii permite fereastra, iar `max-width`
+     de pe canvas o micsoreaza pe ultima bucata. */
+  .grid{display:grid;align-items:start;width:100%;gap:28px;
+        grid-template-columns:minmax(230px,320px) minmax(944px,max-content) minmax(230px,320px);
+        justify-content:space-between}
+  .col{display:flex;flex-direction:column;gap:12px;min-width:0}
+  .center{gap:12px;position:sticky;top:18px}
+  /* panza isi poate schimba gabaritul din prompt; ramane centrata in coloana ei */
+  .center canvas{align-self:center}
+
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px}
+  h2{font-size:10px;letter-spacing:.09em;text-transform:uppercase;color:var(--dim);
+     margin:0 0 9px;font-weight:600}
+  .hdr{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:9px}
+  .hdr h2{margin:0}
+
+  /* `touch-action:none` ține gestul la noi: fără el, o tragere pe ecran tactil derulează
+     pagina și nu mai ajunge niciun pointermove până la pânză. */
+  /* `max-width` nu mai e o regula de ecran mic: pânza poate ajunge la 1256px de element,
+     mai lata decat coloana pe o fereastra obisnuita. Micsorata din CSS ramane exacta —
+     `InputManager.punct` imparte la raportul dintre latimea scrisa si cea desenata. */
+  canvas{background:#ffffff;border:1px solid var(--line);border-radius:10px;display:block;
+         touch-action:none;max-width:100%;height:auto}
+
+  input{width:100%;background:var(--camp);border:1px solid var(--line);color:var(--ink);
+        border-radius:8px;padding:10px 12px;font:inherit;font-size:13.5px}
+  input:focus{outline:none;border-color:var(--accent)}
+  button{background:#f1f4f9;border:1px solid var(--line);color:var(--ink);border-radius:7px;
+         padding:7px 12px;font:inherit;font-size:12px;cursor:pointer;white-space:nowrap}
+  button:hover:not(:disabled){background:#e4eaf3;border-color:var(--accent)}
+  button:disabled{opacity:.5;cursor:default}
+  .bar{display:flex;gap:7px;margin-top:8px}
+  .bar button{flex:1}
+
+  .kv{display:flex;justify-content:space-between;gap:8px;padding:3px 0;
+      border-bottom:1px dashed var(--line);font-size:12px}
+  .kv:last-child{border:0}
+  .kv span:first-child{color:var(--dim);flex-shrink:0}
+  .kv b{text-align:right;min-width:0;overflow-wrap:anywhere}
+
+  code,pre,.mono{font-family:"Cascadia Code",Consolas,monospace}
+  pre{background:var(--camp);border:1px solid var(--line);border-radius:7px;padding:8px;
+      font-size:11px;overflow:auto;margin:0;color:var(--cod);max-height:130px;white-space:pre-wrap;
+      overflow-wrap:anywhere}
+  .q{font-family:"Cascadia Code",Consolas,monospace;font-size:10.5px;color:var(--dim);
+     padding:1px 0 1px 8px;border-left:2px solid var(--line)}
+
+  table{width:100%;border-collapse:collapse;font-size:11.5px}
+  th{text-align:right;color:var(--dim);font-weight:600;font-size:9.5px;text-transform:uppercase;
+     letter-spacing:.05em;padding:4px 3px;border-bottom:1px solid var(--line)}
+  th:first-child,td:first-child{text-align:left}
+  td{padding:5px 3px;border-bottom:1px solid var(--line);text-align:right}
+  tr.win td{color:var(--ok)}
+
+  .ok{color:var(--ok)} .bad{color:var(--bad)} .dim{color:var(--dim)}
+  .path{font-family:"Cascadia Code",Consolas,monospace;font-size:16px;color:var(--accent);
+        overflow-wrap:anywhere}
+  .leaf{font-size:14px;font-weight:600}
+  .new{background:var(--new);color:#ffffff;font-size:9px;font-weight:700;
+       padding:2px 6px;border-radius:20px;letter-spacing:.04em;vertical-align:middle}
+  .chip{display:inline-block;background:var(--camp);border:1px solid var(--line);border-radius:20px;
+        padding:2px 8px;margin:2px 3px 2px 0;font-size:10.5px;
+        font-family:"Cascadia Code",Consolas,monospace;color:var(--cod)}
+  .badge{font-size:9.5px;font-family:"Cascadia Code",Consolas,monospace;padding:2px 7px;
+         border-radius:20px;border:1px solid var(--line);background:var(--camp);color:var(--dim)}
+  .badge.live{border-color:var(--ok);color:var(--ok)}
+  .badge.fallback{border-color:var(--new);color:var(--new)}
+  .note{font-size:10.5px;color:var(--dim);margin-top:5px;line-height:1.45}
+
+  /* Lista de pânze salvate: numele la stânga, data și ștergerea la dreapta.
+     Numele e ce se apasă ca să încarci, deci el primește cursorul de mână. */
+  .panza{display:flex;align-items:center;gap:8px;padding:4px 0;
+         border-bottom:1px dashed var(--line);font-size:12px}
+  .panza:last-child{border:0}
+  .panza b{flex:1;min-width:0;overflow-wrap:anywhere;cursor:pointer;color:var(--accent)}
+  .panza b:hover{text-decoration:underline}
+  .panza span{color:var(--dim);font-size:10.5px;white-space:nowrap}
+  .panza button{padding:1px 8px;font-size:12px;line-height:1.3}
+  /* al doilea câmp dintr-o stivă de câmpuri; primul își ia marginea de la panou */
+  input + input{margin-top:6px}
+
+  /* sub ~1180px nu mai incap trei coloane cu spatiu intre ele */
+  /* sub ~1500px nu mai incap trei coloane in jurul unei panze de 800 */
+  @media (max-width:1620px){
+    .grid{grid-template-columns:minmax(240px,1fr) minmax(944px,max-content);gap:20px;justify-content:center}
+  }
+  @media (max-width:1260px){
+    .grid{grid-template-columns:minmax(min(944px,100%),max-content);justify-content:center}
+    .center{position:static;order:-1}
+  }
+  @media (max-width:860px){
+    .grid{grid-template-columns:1fr}
+  }
+</style>
+</head>
+<!-- Ascuns pana se hotaraste daca sesiunea exista; scriptul de la sfarsit il arata.
+     Fara asta, pânza ar clipi o clipa pe ecranul cuiva care e apoi trimis la poarta. -->
+<body hidden>
+
+
+<div class="grid">
+
+  <!-- ============ STANGA: comanda si ce este figura ============ -->
+  <div class="col">
+
+    <div class="panel">
+      <h2>Resize canvas</h2>
+      <input id="promptPanza" autocomplete="off">
+      <div class="bar">
+        <button id="goPanza">Apply</button>
+      </div>
+      <div class="note">
+        Only the size of the drawing area, between 50 and 1200px per side; it starts
+        at 800. Shapes and text follow it, scaled proportionally on each axis, and
+        whatever still falls outside is brought back in. A request about shapes or text
+        is refused here — it belongs in the box on the right.
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Classification · local, 0 tokens</h2>
+      <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:8px;flex-wrap:wrap">
+        <span class="path" id="bstPath">—</span><span class="leaf" id="bstLeaf">—</span>
+      </div>
+      <div id="bstQ" style="margin-bottom:8px"></div>
+      <div class="kv"><span>classification cost</span><b id="bstCmp">—</b></div>
+      <div class="kv"><span>text binding</span><b id="bindMode" class="mono">—</b></div>
+      <div class="kv"><span>Σ lengths</span><b id="invariant">—</b></div>
+      <div class="kv"><span>check</span><b id="invCheck">—</b></div>
+    </div>
+
+    <div class="panel">
+      <h2>Shapes learned · <span id="learnCount">0</span> of <span id="addressable">?</span></h2>
+      <div id="learned"></div>
+      <div class="note">
+        The catalog starts empty. Every new shape gets its name derived from its
+        attributes and registers itself.
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="hdr"><h2>Selected node · click or drag a box, Shift adds</h2>
+        <button id="deselect">Deselect</button></div>
+      <div id="selInfo" style="margin-bottom:8px;font-size:12px"></div>
+      <div class="note" style="margin:0 0 4px">what actually goes to the API</div>
+      <pre id="payload">—</pre>
+      <div class="note" style="margin:8px 0 4px">current text · index, word, binding</div>
+      <div id="textState"></div>
+      <!-- Sub lista de texte, nu în antet: butonul cade pe exact textele aprinse acolo,
+           iar titlul lui le și numește. -->
+      <div class="bar">
+        <button id="inCaseta" title="no text to put in a box">Put in a box</button>
+      </div>
+      <div class="note">
+        Wrapping text no longer needs a prompt: select and press, and the same press
+        takes it back out. With nothing selected it falls on every text — like any
+        command without a target.
+      </div>
+    </div>
+
+  </div>
+
+  <!-- ============ CENTRU: doar pânza ============ -->
+  <!-- Singură în coloana ei: gabaritul se schimbă din prompt, iar coloana pornește de
+       la 944px ca pânza să aibă loc să se micșoreze și să crească înapoi fără ca restul
+       paginii să sară de fiecare dată. Peste atât — o pânză cerută mai mare decât cea
+       de pornire — coloana crește cu ea, până la 1200px de desen. -->
+  <div class="col center">
+    <canvas id="canvas"></canvas>
+  </div>
+
+  <!-- ====== DREAPTA: comanda pe obiecte, ce costa, si salvarea la capat ====== -->
+  <div class="col">
+
+    <div class="panel">
+      <h2>Create and modify · shapes and text</h2>
+      <input id="promptFiguri" autocomplete="off">
+      <div class="bar">
+        <button id="goFiguri">Run</button>
+        <button id="undo" title="Undoes the last change, the canvas one included">Undo</button>
+      </div>
+      <div class="note">
+        Create, move, split, write, text box. The canvas size is requested in the box
+        on the left. <b>Undo</b> reverses the last change, whichever of the two it was.
+      </div>
+      <div class="note">
+        Shapes, texts and boxes can also be moved <b>directly on the canvas</b>: hold
+        the left button on them and drag. Dragged <b>from empty space</b>, the same
+        gesture draws a selection rectangle — everything it touches joins the selection
+        and then moves together. <b>Shift</b> adds to what was already selected. One
+        drag is a single change, so <b>Undo</b> reverses all of it.
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="hdr"><h2>DSL emitted by the model</h2><span class="badge" id="srcBadge">—</span></div>
+      <pre id="dsl">— run a prompt —</pre>
+      <div class="note" id="resolved"></div>
+      <div class="note">connected to <span class="mono" id="provider">—</span></div>
+    </div>
+
+    <div class="panel">
+      <h2>Cost per conversation</h2>
+      <div class="kv"><span>turns</span><b id="convoTurns">0</b></div>
+      <div class="kv"><span>this turn</span><b id="convoNow">—</b></div>
+      <div class="kv"><span>cumulative</span><b id="convoTotal">—</b></div>
+      <div class="kv"><span>with history it would be</span><b id="convoHist">—</b></div>
+      <div class="note">
+        Every turn sends the instructions (constant) plus the node and its parent.
+        Never the history, so turn 50 costs what turn 1 costs.
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Cost per call · skeleton of <span id="skelSize">?</span> questions</h2>
+      <table>
+        <thead><tr><th>Strategy</th><th>in</th><th>out</th><th>total</th><th>×</th></tr></thead>
+        <tbody id="tokenBody"><tr><td colspan="5" style="text-align:left;color:var(--dim)">—</td></tr></tbody>
+      </table>
+      <div class="note" style="margin:9px 0 4px">the actual model output</div>
+      <pre id="dslOut">—</pre>
+      <div class="note" style="margin:8px 0 4px">what the vision variant would have sent</div>
+      <pre id="coordsOut">—</pre>
+    </div>
+
+    <!-- Salvarea sta la CAPATUL coloanei din dreapta, sub crearea si modificarea
+         figurilor: intai faci desenul, apoi il pastrezi. In coltul din stanga sus era
+         primul lucru pe care il vedea ochiul, desi e ultimul pe care il faci.
+
+         Autentificarea NU e aici: are pagina ei, `/`, si pana nu treci pe acolo nu
+         ajungi in pagina asta. Panoul presupune deci ca omul e cunoscut. Apare doar
+         cand serverul are Supabase configurat; fara el aplicatia merge la fel, doar
+         ca nu salveaza nicaieri. -->
+    <div class="panel" id="cont" hidden>
+      <div class="hdr"><h2>Account</h2><span class="badge live" id="contStare">—</span></div>
+
+      <input id="contNume" placeholder="canvas name" autocomplete="off">
+      <div class="bar">
+        <button id="contSalveaza">Save</button>
+        <button id="contPanze">My canvases</button>
+      </div>
+      <div class="bar">
+        <button id="contIesi">Sign out</button>
+      </div>
+
+      <div class="note" id="contMesaj"></div>
+      <div class="note">
+        The same name overwrites the previous canvas; a new name makes a copy.
+        <b>My canvases</b> goes back to the list, where you pick another one or start a
+        new one.
+      </div>
+    </div>
+
+  </div>
+</div>
+
+<script type="module">
+  // Poarta, a doua oara. `index.html` o tine pentru cine vine de pe drumul normal;
+  // aici se tine pentru cine ajunge direct la adresa asta. Verificarea se face INAINTE
+  // de `new App()`, deci fara sesiune nu se construieste nimic si nu se deseneaza nimic
+  // — nu e o pânză ascunsă, e o pânză care nu s-a facut.
+  import { Cont } from './src/cont/Cont.js';
+  import { App } from './src/core/App.js';
+
+  const cont = await Cont.creeaza();
+
+  // Fără sesiune, înapoi la poartă pe drumul de CURĂȚARE (`iesi`), nu printr-un salt
+  // simplu: un salt ar lăsa poarta cu sesiunea ei scrisă local, ea ar crede că ești
+  // logat și te-ar trimite înapoi încoace — la nesfârșit.
+  //
+  // `iesi` întoarce `false` când nu e nimic altundeva de curățat (o instalare cu un
+  // singur container). Atunci n-are unde să trimită, deci arată aplicația: mai bine
+  // fără cont decât într-o adresă „http://localhost:undefined/".
+  const laPoarta = cont && !cont.autentificat && await cont.iesi();
+
+  if (!laPoarta) {
+    // Corpul sta ascuns din marcaj cat tine verificarea, ca nimeni sa nu apuce sa vada
+    // pânza altcuiva pentru o clipa. Se arata abia dupa ce s-a hotarat ca are voie.
+    document.body.hidden = false;
+    new App(cont);
+  }
+</script>
+</body>
+</html>

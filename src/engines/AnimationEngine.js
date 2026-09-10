@@ -33,8 +33,10 @@ function flatten(scene) {
 
 function rebuild(template, flat) {
   return {
-    // casetele trec neinterpolate: se recalculeaza oricum la fiecare layout
+    // casetele si cadrul de selectie trec neinterpolate: primele se recalculeaza
+    // oricum la fiecare layout, al doilea atarna de cursor, nu de vreo animatie
     casete: template.casete || [],
+    cadru: template.cadru || null,
     panza: flat['panza.w'] !== undefined
       ? { w: flat['panza.w'], h: flat['panza.h'] }
       : template.panza,
@@ -92,6 +94,7 @@ export class AnimationEngine {
       edges: [...scene.edges, ...ghostE],
       words: [...scene.words, ...ghostW],
       casete: scene.casete || [],
+      cadru: scene.cadru || null,
       panza: scene.panza,
     };
     this.ghostKeys = flattenKeys(ghostE, ghostW);

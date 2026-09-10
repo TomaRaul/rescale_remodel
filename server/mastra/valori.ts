@@ -1,13 +1,30 @@
-// base/valori.js — marimile si micile unelte pe care le folosesc toti agentii.
+// mastra/valori.ts — marimile si micile unelte pe care le folosesc toti agentii.
 //
 // Aici stau doar lucrurile care nu apartin niciunui domeniu: pretul pe care il
 // plateste geometria si textul deopotriva. Orice cunoastere despre figuri sau
-// despre cuvinte sta in clasa agentului respectiv, nu aici.
+// despre cuvinte sta in promptul si schema agentului respectiv, nu aici.
+//
+// Fisierul asta nu importa nimic din Mastra: e aceeasi aritmetica de dinainte de
+// migrare, si tot ea tine testele de validare in picioare.
 
 export const NL = String.fromCharCode(10);
 
-/** Latura panzei, in pixeli. Coordonatele in afara ei sunt respinse la validare. */
+/**
+ * Latura panzei de PORNIRE, in pixeli. Atat descrie promptul de sistem, si tot dupa ea
+ * se hotaraste daca starea mai trebuie sa poarte o linie cu gabaritul de acum.
+ */
 export const PANZA = 800;
+
+/**
+ * Cat poate ajunge panza, pe latura. Aici e plafonul VALIDARII: coordonatele si
+ * marimile de peste el se resping.
+ *
+ * Nu se confunda cu cea de pornire. Serverul nu stie cat e panza in clipa asta — o afla
+ * din stare, dar validarea se face pe forma raspunsului, inainte — deci taie dupa cel
+ * mai mare gabarit cu putinta. Ce trece de aici si totusi nu incape pe panza de acum e
+ * oprit in motor, de „inCanvas", care stie exact cat e.
+ */
+export const PANZA_MAX = 1200;
 
 /**
  * Prima cheie prezenta din lista.
@@ -16,28 +33,33 @@ export const PANZA = 800;
  * forma lunga, iar un model care ignora scurtarile nu trebuie sa esueze din cauza
  * asta. Amandoua trec prin acelasi drum: `ia(g, 'o', 'op')`.
  */
-export const ia = (o, ...chei) => {
+export const ia = (o: unknown, ...chei: string[]): unknown => {
   if (!o || typeof o !== 'object') return undefined;
-  for (const k of chei) if (o[k] !== undefined) return o[k];
+  const rec = o as Record<string, unknown>;
+  for (const k of chei) if (rec[k] !== undefined) return rec[k];
   return undefined;
 };
 
-export const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+export const clamp = (v: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, v));
 
-/** Numar de pixeli, rotunjit si tinut pe panza. */
-export const cel = v => clamp(Math.round(Number(v)), 1, PANZA);
+/** Numar de pixeli, rotunjit si tinut pe cea mai mare panza cu putinta. */
+export const cel = (v: unknown) => clamp(Math.round(Number(v)), 1, PANZA_MAX);
+
+export type Punct = { x: number; y: number };
 
 /** Punct, fie ca vine ca [x,y] (forma minificata) fie ca {x,y} (forma lunga). */
-export const punct = q => {
+export const punct = (q: unknown): Punct | null => {
   if (!q) return null;
-  const [rx, ry] = Array.isArray(q) ? q : [q.x, q.y];
+  const [rx, ry] = Array.isArray(q)
+    ? q
+    : [(q as Punct).x, (q as Punct).y];
   const x = Math.round(Number(rx)), y = Math.round(Number(ry));
   return Number.isInteger(x) && Number.isInteger(y)
-      && x >= 0 && x <= PANZA && y >= 0 && y <= PANZA ? { x, y } : null;
+      && x >= 0 && x <= PANZA_MAX && y >= 0 && y <= PANZA_MAX ? { x, y } : null;
 };
 
 /** Fara diacritice si cu litere mici: tiparele de rutare se scriu o singura data. */
-export const norm = t => String(t).toLowerCase()
+export const norm = (t: unknown) => String(t).toLowerCase()
   .replace(/[ăâ]/g, 'a').replace(/î/g, 'i')
   .replace(/[șş]/g, 's').replace(/[țţ]/g, 't');
 
@@ -51,7 +73,7 @@ export const norm = t => String(t).toLowerCase()
  *
  * Nu apartine niciunui domeniu — si geometrul si tipograful spun pe cine cade comanda.
  */
-export function tinta(d, out) {
+export function tinta(d: unknown, out: Record<string, unknown>) {
   const tg = ia(d, 'n', 'target');
   if (!Array.isArray(tg)) return out;
   const bune = tg.map(x => {
@@ -65,7 +87,7 @@ export function tinta(d, out) {
 }
 
 /** Motivul scurt pe care il intoarce modelul, taiat la o lungime rezonabila. */
-export function motiv(d) {
+export function motiv(d: unknown) {
   const why = ia(d, 'y', 'why');
   return typeof why === 'string' ? why.slice(0, 80) : '';
 }

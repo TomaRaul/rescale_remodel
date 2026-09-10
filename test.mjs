@@ -13,15 +13,17 @@ const { layout, schimbaCaseta, restrange, CASETA } = await import(B + 'engines/L
 const { Asezator }   = await import(B + 'text/Asezator.js');
 const PP             = await import(B + 'interaction/PromptParser.js');
 const TM             = await import(B + 'interaction/TokenMeter.js');
-const LLM            = await import('./server/llm.js');
-const { Geometru }   = await import('./server/agents/geometry/Geometru.js');
-const { Tipograf }   = await import('./server/agents/text/Tipograf.js');
-const { Router }     = await import('./server/agents/routing/Router.js');
-const { Casetar }    = await import('./server/agents/textbox/Casetar.js');
-const { Echipa }     = await import('./server/agents/orchestration/Echipa.js');
-const { ModelClient } = await import('./server/providers.js');
+const LLM            = await import('./dist/llm.js');
+const { GEOMETRU, TIPOGRAF, CASETAR } = await import('./dist/mastra/agenti.js');
+const { Router }     = await import('./dist/mastra/router.js');
+const { combina }    = await import('./dist/mastra/flux.js');
+const { lantModele, REZERVE } = await import('./dist/mastra/modele.js');
+const MEM = await import('./dist/memorie.js');
+const { IESIRE_GEOM, IESIRE_TEXT, IESIRE_CASETA, MAX_PASI } = await import('./dist/mastra/scheme.js');
 
-const { GRID, CELL, AX, CANVAS_PX, pointPixel, toLogic, inCanvas } = SC;
+const { GRID, CELL, AX, CANVAS_PX, PANZA_MAX, pointPixel, toLogic, inCanvas } = SC;
+/** Câte celule încap pe latura celei mai mari pânze — domeniul catalogului. */
+const CELULE = PANZA_MAX / CELL;
 const CANVAS = { w: CANVAS_PX, h: CANVAS_PX, pad: 6 };
 
 // stub de măsurare care ține cont de mărimea fontului, ca în browser
@@ -38,13 +40,19 @@ const ctx = {
 
 let fail = 0;
 const ok = (c, m) => { console.log((c ? '  PASS  ' : '  FAIL  ') + m); if (!c) fail++; };
-const est = t => Math.ceil((t || '').length / 4);
+const est = TM.est;   // acelasi estimator ca aplicatia, nu o copie care poate ramane in urma
 const dreptunghi = (w, h) => OPS.rect(CANVAS, w, h);   // acum in PIXELI
 
 // ─────────────────────────────────────────────────────────── 1. grila
 console.log('=== 1. grila și coordonatele ===');
 ok(GRID === 16 && CELL === 50, `grilă ${GRID}×${GRID}, reper la fiecare ${CELL}px`);
-ok(CANVAS_PX === GRID * CELL, `zonă de desen ${CANVAS_PX}×${CANVAS_PX}`);
+ok(CANVAS_PX === GRID * CELL, `pânza de PORNIRE, ${CANVAS_PX}×${CANVAS_PX}`);
+// Pornirea și plafonul sunt două lucruri diferite: pânza începe la 800, dar poate fi
+// dusă până la 1200. Cât timp stăteau în aceeași constantă, distincția nu se punea.
+ok(PANZA_MAX === 1200 && PANZA_MAX > CANVAS_PX,
+   `pânza poate crește până la ${PANZA_MAX}×${PANZA_MAX}, peste cea de pornire`);
+ok(SC.limPanza(9999) === PANZA_MAX && SC.limPanza(10) === SC.PANZA_MIN,
+   `o latură cerută se ține între ${SC.PANZA_MIN} și ${PANZA_MAX}px`);
 const p00 = pointPixel(0, 0), p16 = pointPixel(CANVAS_PX, CANVAS_PX);
 ok(p00.x === 0 && p00.y === CANVAS_PX, `(0,0) e în colțul din STÂNGA JOS: ${p00.x},${p00.y}`);
 ok(p16.x === CANVAS_PX && p16.y === 0, `(800,800) e în dreapta sus: ${p16.x},${p16.y}`);
@@ -64,8 +72,8 @@ ok(Object.keys(OPS).sort().join(',') === 'anchorAt,moveTo,rect,resize,scaleToFit
 
 const patrat = dreptunghi(150, 150);
 const drept = dreptunghi(300, 150);
-for (const [f, nume, w, h] of [[patrat, 'PATRAT', 150, 150], [drept, 'DREPTUNGHI', 300, 150],
-                               [dreptunghi(100, 400), 'DREPTUNGHI', 100, 400], [dreptunghi(800, 800), 'PATRAT', 800, 800]]) {
+for (const [f, nume, w, h] of [[patrat, 'SQUARE', 150, 150], [drept, 'RECTANGLE', 300, 150],
+                               [dreptunghi(100, 400), 'RECTANGLE', 100, 400], [dreptunghi(800, 800), 'SQUARE', 800, 800]]) {
   const sig = f.signature();
   const hit = CAT.search(sig);
   const b = f.bbox();
@@ -82,10 +90,15 @@ console.log('\n=== 3. catalogul pe atribute ===');
 ok(CAT.ATTRIBUTES.length === 3, `${CAT.ATTRIBUTES.length} atribute: ${CAT.ATTRIBUTES.map(a => a.id).join(', ')}`);
 ok(CAT.skeleton().split('\n').length === 3, 'scheletul are 3 întrebări, constant');
 console.log('  ' + CAT.ATTRIBUTES.map(a => a.q).join('\n  '));
-ok(CAT.addressable() === 8 * GRID * GRID, `${CAT.addressable()} combinații adresabile`);
-ok(CAT.search(dreptunghi(200, 200).signature()).leaf === 'PATRAT', 'lățime = înălțime → PATRAT');
-ok(CAT.search(dreptunghi(200, 250).signature()).leaf === 'DREPTUNGHI', 'lățime ≠ înălțime → DREPTUNGHI');
-ok(CAT.search(Figure.empty().signature()).leaf === 'GOL', 'figura goală → GOL');
+// Domeniul catalogului se măsoară după cea mai MARE pânză, nu după cea de pornire: pe
+// una de 1200 chiar există figuri de 20 de celule, iar plafonate la 16 ar primi codul
+// unei figuri de 16 — două forme diferite cu același nume.
+ok(CAT.addressable() === 8 * CELULE * CELULE, `${CAT.addressable()} combinații adresabile`);
+ok(CAT.code(dreptunghi(1000, 100).signature()).split('|')[1] === String(1000 / CELL),
+   'o figură mai lată decât pânza de pornire își primește lățimea adevărată, nu 16');
+ok(CAT.search(dreptunghi(200, 200).signature()).leaf === 'SQUARE', 'lățime = înălțime → PATRAT');
+ok(CAT.search(dreptunghi(200, 250).signature()).leaf === 'RECTANGLE', 'lățime ≠ înălțime → DREPTUNGHI');
+ok(CAT.search(Figure.empty().signature()).leaf === 'EMPTY', 'figura goală → GOL');
 ok(CAT.search(dreptunghi(300, 150).signature()).path === CAT.search(dreptunghi(300, 150).signature()).path,
    'același gabarit → același cod');
 ok(CAT.search(dreptunghi(300, 150).signature()).path !== CAT.search(dreptunghi(150, 300).signature()).path,
@@ -106,7 +119,7 @@ for (const [f, eticheta] of [
 const s2 = OPS.split(drept, CANVAS, 2);
 ok(s2.polylines.length === 2 && s2.polylines.every(p => p.closed && p.segs.length === 4),
    'split dă piese închise, tot cu 4 laturi fiecare');
-ok(CAT.search(s2.signature()).leaf === 'GRUP_2', 'două piese → GRUP_2');
+ok(CAT.search(s2.signature()).leaf === 'GROUP_2', 'două piese → GRUP_2');
 const c0 = new Figure([s2.polylines[0]]).centroid();
 const c1 = new Figure([s2.polylines[1]]).centroid();
 ok(Math.abs(c0.x - c1.x) > 20, 'piesele stau alăturate pe orizontală, nu suprapuse');
@@ -601,7 +614,10 @@ console.log('\n=== 7. validarea DSL ===');
 const V = LLM.validate;
 ok(V({ geom: { op: 'rect', w: 300, h: 150, at: { x: 400, y: 400 } } }).geom.w === 300, 'rect cu w/h trece');
 ok(V({ geom: { op: 'rect', size: 200, at: { x: 100, y: 100 } } }).geom.h === 200, '"size" se extinde în w=h');
-ok(V({ geom: { op: 'rect', w: 9999, h: 0, at: { x: 1, y: 1 } } }).geom.w === 800, 'dimensiuni absurde sunt plafonate la lățimea pânzei');
+ok(V({ geom: { op: 'rect', w: 9999, h: 0, at: { x: 1, y: 1 } } }).geom.w === PANZA_MAX,
+   'dimensiuni absurde sunt plafonate la cea mai mare pânză cu putință');
+ok(V({ geom: { op: 'rect', w: 150, h: 150, at: { x: 1000, y: 1000 } } }).geom.at.x === 1000,
+   'un punct care încape pe o pânză crescută trece validarea');
 ok(V({ geom: { op: 'rect', at: { x: 1, y: 1 } } }).geom.w === undefined,
    'fără dimensiune, w rămâne lipsă — motorul refuză generarea');
 ok(V({ geom: { op: 'rect', w: 150, h: 150, at: { x: 9999, y: 1 } } }).geom.at === undefined,
@@ -648,12 +664,12 @@ ok(V({ t: { b: 'x', z: [300, 80] } }).text.box.w === 300, 'z → box, [lățime,
 ok(V({ t: { b: 'x', z: [300, 80] } }).text.box.h === 80, 'înălțimea cerută trece');
 ok(V({ t: { b: 'x', z: [300] } }).text.box.h === 0, 'fără înălțime, caseta se strânge pe rânduri (h:0)');
 ok(V({ t: { b: 'x', z: [5, 5] } }).text.box.w === 20, 'o casetă absurd de mică e ridicată la minim');
-ok(V({ t: { b: 'x', z: [9999, 9999] } }).text.box.w === 800, 'o casetă mai mare decât pânza e plafonată');
+ok(V({ t: { b: 'x', z: [9999, 9999] } }).text.box.w === PANZA_MAX, 'o casetă absurd de mare e plafonată');
 ok(V({ t: { f: 40 } }).text.boxDelta === 40, 'f → boxDelta, mărirea casetei în pixeli');
 ok(V({ t: { f: -25 } }).text.boxDelta === -25, 'f negativ micșorează caseta');
 ok(V({ t: { f: [50, 200] } }).text.boxDelta.w === 50, 'f ca pereche → lățimea, prima cifră');
 ok(V({ t: { f: [50, 200] } }).text.boxDelta.h === 200, 'f ca pereche → înălțimea, a doua cifră');
-ok(V({ t: { f: [9999, -9999] } }).text.boxDelta.w === 800, 'perechea e plafonată pe fiecare axă');
+ok(V({ t: { f: [9999, -9999] } }).text.boxDelta.w === PANZA_MAX, 'perechea e plafonată pe fiecare axă');
 ok(V({ t: { f: [0, 200] } }).text.boxDelta.h === 200, 'zero pe o axă e valid: crește doar cealaltă');
 let perecheGoala = false;
 try { V({ t: { f: [0, 0] } }); } catch { perecheGoala = true; }
@@ -772,22 +788,33 @@ ok(LLM.agenti('mareste tot dreptunghiul').join() === 'geometrie',
 // mai jos sunt un CONTRACT — dacă o schimbare le depăşeşte, testul pică şi spune pe ce
 // caz, în loc ca preţul să se vadă abia pe factură.
 //
-// Cifrele sunt estimate (~4 caractere/token), nu `countTokens`: contează ca prag
-// stabil şi comparabil între rulări, nu ca adevăr absolut. Marja e ~5% peste măsurat:
-// strânsă cât să pice la un rând adăugat, largă cât să nu pice la o reformulare.
+// Cifrele sunt estimate, nu `countTokens`: un test nu are voie să cheme API-ul, iar ce
+// se cere aici e un prag stabil şi comparabil între rulări. Estimatorul e însă CALIBRAT
+// pe tokenizatorul real (vezi `CHR_PER_TOKEN` din TokenMeter.js): pe cele unsprezece
+// cazuri de mai jos se abate cu -1.7% de la totalul măsurat şi cu cel mult 8% pe caz.
+// Marja e ~5% peste estimat: strânsă cât să pice la un rând adăugat, largă cât să nu
+// pice la o reformulare.
+//
+// Pragurile au fost rescrise odată cu estimatorul, în 2026-09-03. Cele vechi erau scrise
+// într-o monedă cu 45% mai ieftină decât realitatea: „760" însemna de fapt 1130 de tokeni
+// pe factură, iar testul trecea. Un contract în unităţi greşite nu e un contract.
 console.log('\n--- pragul de tokeni pe ramură ---');
 const PRAGURI = [
-  ['fa un dreptunghi de 300 pe 150 la 400,400', 'geometrie',              705],
-  ['imparte figura 0 in 3',                     'geometrie',              667],
-  ['muta figura 1 la 400,400',                  'geometrie',              667],
-  ['sterge textul',                             'text',                   705],
-  ['mareste textul',                            'text',                   705],
-  ['mareste caseta cu 40 de pixeli',            'caseta',                 795],
-  ['pune textul pe latura de sus',              'text',                  1435],
-  ['scrie MIAU in figura',                      'text',                  1435],
-  ['pune textul intr-o caseta',                 'text+caseta',           1435],
-  ['micsoreaza panza la 250 pe 100',            'geometrie',              560],
-  ['ceva necunoscut',                           'geometrie+text+caseta', 3400],
+  // Crearea plăteşte şi exemplul de LANŢ — „un pătrat … şi un dreptunghi …" într-un
+  // singur prompt. Fără el, un model mic nu emite niciodată lista şi capacitatea nu
+  // există în practică. Măsurat cu tokenizatorul real: 103 tokeni, pentru operaţii care
+  // altfel cereau două ture întregi.
+  ['fa un dreptunghi de 300 pe 150 la 400,400', 'geometrie',             1090],
+  ['imparte figura 0 in 3',                     'geometrie',              970],
+  ['muta figura 1 la 400,400',                  'geometrie',              970],
+  ['sterge textul',                             'text',                  1010],
+  ['mareste textul',                            'text',                  1010],
+  ['mareste caseta cu 40 de pixeli',            'caseta',                1145],
+  ['pune textul pe latura de sus',              'text',                  2055],
+  ['scrie MIAU in figura',                      'text',                  2055],
+  ['pune textul intr-o caseta',                 'text+caseta',           2150],
+  ['micsoreaza panza la 250 pe 100',            'geometrie',              830],
+  ['ceva necunoscut',                           'geometrie+text+caseta', 4970],
 ];
 for (const [cerere, agentiAsteptati, prag] of PRAGURI) {
   const ag = LLM.agenti(cerere);
@@ -798,9 +825,9 @@ for (const [cerere, agentiAsteptati, prag] of PRAGURI) {
 }
 // Baza comună pleacă o dată PER AGENT chemat, deci fiecare rând din ea se plăteşte
 // de până la trei ori. E locul unde un rând în plus costă cel mai mult.
-const { Agent: AgentBaza } = await import('./server/agents/base/Agent.js');
-ok(est(AgentBaza.COMUN.join('\n')) <= 213,
-   `baza comună: ~${est(AgentBaza.COMUN.join('\n'))} tokeni, plătiţi de fiecare agent chemat`);
+const { COMUN } = await import('./dist/mastra/prompturi/comun.js');
+ok(est(COMUN.join('\n')) <= 310,
+   `baza comună: ~${est(COMUN.join('\n'))} tokeni, plătiţi de fiecare agent chemat`);
 
 // izolarea domeniilor e impusă la validare, nu doar prin instrucțiuni
 const geoCuText = V({ g: { o: 'r', w: 50, h: 50, p: [10, 10] }, t: { s: ['HACK'] } }, 'geometrie');
@@ -825,26 +852,26 @@ ok(V({ t: { s: ['X'], b: 'x', z: [300, 80] } }).text.set.join() === 'X'
 
 
 // fiecare agent citeste DOAR campul lui: nu e o stergere la final, e cod lipsa
-const geo = new Geometru(), tip = new Tipograf();
-ok(geo.valideaza({ t: { s: ['ALFA'] } }) === null,
-   'Geometru.valideaza ignoră complet un câmp de text');
-ok(tip.valideaza({ g: { o: 'r', w: 50, h: 50 } }) === null,
-   'Tipograf.valideaza ignoră complet o operație de figură');
-ok(geo.valideaza({ g: { o: 's', n: 3 } }).into === 3, 'Geometru citește split');
-ok(tip.valideaza({ t: { b: 'i', s: ['X'] } }).bind === 'inside', 'Tipograf citește bind');
+const geo = GEOMETRU, tip = TIPOGRAF;
+ok(geo.citeste({ t: { s: ['ALFA'] } }) === null,
+   'Geometru citește doar câmpul lui: ignoră complet un câmp de text');
+ok(tip.citeste({ g: { o: 'r', w: 50, h: 50 } }) === null,
+   'Tipograf citește doar câmpul lui: ignoră complet o operație de figură');
+ok(geo.citeste({ g: { o: 's', n: 3 } }).into === 3, 'Geometru citește split');
+ok(tip.citeste({ t: { b: 'i', s: ['X'] } }).bind === 'inside', 'Tipograf citește bind');
 
 // --- casetarul: al treilea agent, cu domeniul lui
-const cas = new Casetar();
-ok(cas.valideaza({ t: { s: ['ALFA'], b: 'i', k: 1.4 } }) === null,
+const cas = CASETAR;
+ok(cas.citeste({ t: { s: ['ALFA'], b: 'i', k: 1.4 } }) === null,
    'Casetar ignoră complet conținutul și legările tipografului');
-ok(cas.valideaza({ g: { o: 'r', w: 50, h: 50 } }) === null, 'Casetar ignoră complet figurile');
-ok(cas.valideaza({ t: { b: 'x' } }).bind === 'box', 'Casetar citește b:x');
-ok(cas.valideaza({ t: { z: [300, 80] } }).box.w === 300, 'Casetar citește z');
-ok(cas.valideaza({ t: { f: 40 } }).boxDelta === 40, 'Casetar citește f');
+ok(cas.citeste({ g: { o: 'r', w: 50, h: 50 } }) === null, 'Casetar ignoră complet figurile');
+ok(cas.citeste({ t: { b: 'x' } }).bind === 'box', 'Casetar citește b:x');
+ok(cas.citeste({ t: { z: [300, 80] } }).box.w === 300, 'Casetar citește z');
+ok(cas.citeste({ t: { f: 40 } }).boxDelta === 40, 'Casetar citește f');
 // izolarea e COD LIPSA, nu un câmp șters la final
-ok(tip.valideaza({ t: { b: 'x' } }) === null,
+ok(tip.citeste({ t: { b: 'x' } }) === null,
    'Tipograf nu mai recunoaște caseta — a rămas fără cod pentru ea');
-ok(tip.valideaza({ t: { f: 40 } }) === null, 'Tipograf ignoră mărimea casetei');
+ok(tip.citeste({ t: { f: 40 } }) === null, 'Tipograf ignoră mărimea casetei');
 ok(cas.numeRamuri.join(',') === 'caseta', 'Casetar își declară ramura');
 ok(cas.camp === 'caseta' && tip.camp === 'text' && geo.camp === 'geom',
    'trei câmpuri diferite: doi agenți nu se pot suprascrie la combinare');
@@ -853,11 +880,11 @@ ok(new Router([geo, tip, cas]).alege('mareste caseta cu 40 de pixeli')[0] === ca
    'routerul alege casetarul după ramura lui, fără să-l știe pe nume');
 
 // combinarea: „caseta" se topește în „text", și vine ULTIMA
-const combCas = Echipa.combina([
-  { agent: tip, dsl: { geom: null, text: { set: ['ALFA'], bind: 'inside' }, why: 'text' },
-    usage: { in: 1, out: 1 }, model: 'm', incercari: 1 },
-  { agent: cas, dsl: { geom: null, caseta: { bind: 'box', box: { w: 300, h: 0 } }, why: 'caseta' },
-    usage: { in: 1, out: 1 }, model: 'm', incercari: 1 },
+const combCas = combina([
+  { domeniu: 'text', chemat: true, camp: 'text',
+    dsl: { geom: null, text: { set: ['ALFA'], bind: 'inside' }, why: 'text' }, usage: { in: 1, out: 1 } },
+  { domeniu: 'caseta', chemat: true, camp: 'caseta',
+    dsl: { geom: null, caseta: { bind: 'box', box: { w: 300, h: 0 } }, why: 'caseta' }, usage: { in: 1, out: 1 } },
 ]);
 ok(combCas.dsl.text.set.join() === 'ALFA', 'conținutul vine de la tipograf');
 ok(combCas.dsl.text.bind === 'box',
@@ -867,7 +894,7 @@ ok(combCas.dsl.caseta === undefined, 'câmpul „caseta" nu ajunge la motor — 
 
 // „nu e treaba mea" e un raspuns, nu o eroare
 let aruncatGol = false;
-try { geo.citeste('{"g":null,"y":"nimic"}'); } catch (e) { aruncatGol = e.name === 'RaspunsGol'; }
+try { geo.citesteRaspuns({ g: null, y: 'nimic' }); } catch (e) { aruncatGol = e.name === 'RaspunsGol'; }
 ok(aruncatGol, 'un agent fără ce răspunde aruncă RaspunsGol, nu o eroare oarecare');
 
 // routerul nu-i cunoaste pe agenti pe nume, se uita ce ramuri declara
@@ -880,9 +907,11 @@ ok(new Router([geo]).alege('sterge textul').length === 1,
    'cu un singur agent în echipă, el primește tot — nu rămâne nimeni nechemat');
 
 // combinarea: fiecare pune doar in campul lui
-const comb = Echipa.combina([
-  { agent: geo, dsl: { geom: { op: 'rect' }, text: null, why: 'figura' }, usage: { in: 10, out: 2 }, model: 'm', incercari: 1 },
-  { agent: tip, dsl: { geom: null, text: { bind: 'inside' }, why: 'text', target: [1] }, usage: { in: 20, out: 3 }, model: 'm', incercari: 1 },
+const comb = combina([
+  { domeniu: 'geometrie', chemat: true, camp: 'geom',
+    dsl: { geom: { op: 'rect' }, text: null, why: 'figura' }, usage: { in: 10, out: 2 } },
+  { domeniu: 'text', chemat: true, camp: 'text',
+    dsl: { geom: null, text: { bind: 'inside' }, why: 'text', target: [1] }, usage: { in: 20, out: 3 } },
 ]);
 ok(comb.dsl.geom.op === 'rect' && comb.dsl.text.bind === 'inside', 'combinarea ia din fiecare agent domeniul lui');
 ok(comb.dsl.target.join() === '1', 'ținta trece prin combinare');
@@ -890,149 +919,225 @@ ok(comb.usage.in === 30 && comb.usage.out === 5, 'consumul se adună peste agen�
 ok(comb.dsl.why === 'figura; text', 'motivele se lipesc');
 
 
-// ── lantul de rezerve si memoria cotei ────────────────────────────────────────
-// Un model epuizat nu se reface intre doua apeluri la o secunda distanta, deci
-// merita ocolit — altfel fiecare cerere plateste din nou dus-intorsul catre el.
-const fals = { id: 'test', env: null, native: false, url: 'http://exemplu' };
-const altul = { id: 'altul', env: null, native: false, url: 'http://altul' };
-const per = (p, model) => ({ p, model });
-const mc = new ModelClient([per(fals, 'a'), per(fals, 'b'), per(altul, 'c')]);
-const lista = c => c.deIncercat().map(ModelClient.nume).join();
-
-ok(lista(mc) === 'test:a,test:b,altul:c', 'fără eșecuri, se încearcă toți candidații în ordine');
-ok(mc.provider.id === 'test', 'primul candidat dă providerul principal, cel afișat în interfață');
-
-ModelClient.pauzeaza('test:a');
-ok(lista(mc) === 'test:b,altul:c', 'un model epuizat e ocolit la apelurile următoare');
-ModelClient.pauzeaza('test:b');
-ok(lista(mc) === 'altul:c',
-   'când un provider e epuizat de tot, lanțul trece la ALT provider');
-ModelClient.pauzeaza('altul:c');
-ok(lista(mc) === 'test:a,test:b,altul:c',
-   'dacă TOȚI sunt pe pauză, se încearcă totuși — mai bine lent decât deloc');
-ModelClient._pauzat.clear();
-
-ok(ModelClient.nume(per(fals, 'a')) !== ModelClient.nume(per(altul, 'a')),
-   'același nume de model la doi provideri sunt candidați diferiți');
-
-ok(ModelClient.COTA.test('You exceeded your current quota'), 'eroarea de cotă e recunoscută');
-ok(!ModelClient.COTA.test('API key not valid'), 'o cheie greșită NU e tratată ca epuizare de cotă');
-
-// apelurile esuate se numara si se pun in jurnal, ca un tur lent sa aiba explicatie
-const client = new ModelClient([per(fals, 'x'), per(altul, 'y')]);
-client.unApel = async c => {
-  if (c.model === 'x') throw new Error('You exceeded your current quota');
-  return { text: '{"g":{"o":"c"}}', usage: { in: 1, out: 1 } };
-};
-const rr = await client.cere('sys', 'user', b => JSON.parse(b));
-const jur = rr.jurnal;
-ok(rr.incercari === 2 && jur.length === 2, 'jurnalul are câte o intrare pe încercare');
-ok(jur[0].ok === false && jur[1].ok === true, 'jurnalul spune care a picat și care a răspuns');
-ok(jur[0].provider === 'test' && jur[1].provider === 'altul',
-   'jurnalul spune de la ce provider a venit fiecare încercare');
-ok(rr.provider === 'altul' && rr.model === 'y',
-   'se raportează providerul care CHIAR a răspuns, nu cel principal');
-ok(ModelClient.ocolit('test:x'), 'modelul care a picat pe cotă rămâne ocolit');
-ModelClient._pauzat.clear();
-ModelClient._memorie.clear();
-
-
-
-// lantul se construieste PESTE provideri: o a doua cheie in .env chiar foloseste
-const cheiVechi = { g: process.env.GEMINI_API_KEY, q: process.env.GROQ_API_KEY };
-process.env.GEMINI_API_KEY = 'test';
-delete process.env.GROQ_API_KEY;
-const doarGemini = await ModelClient.creeaza();
-ok(doarGemini.candidati.every(c => c.p.id === 'gemini'),
-   'cu o singură cheie, lanțul e tot la un provider');
-
-process.env.GROQ_API_KEY = 'test';
-const amandoua = await ModelClient.creeaza();
-const idm = amandoua.candidati.map(c => c.p.id);
-ok(idm[0] === 'gemini' && idm.includes('groq'),
-   'cu două chei, lanțul trece la Groq după ce se termină modelele Gemini');
-ok(idm.lastIndexOf('gemini') < idm.indexOf('groq'),
-   'toate rezervele Gemini se încearcă înaintea schimbării de provider');
-ok(amandoua.provider.id === 'gemini',
-   'providerul principal rămâne primul din listă — Groq e rezervă, nu înlocuitor');
-
-if (cheiVechi.g === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = cheiVechi.g;
-if (cheiVechi.q === undefined) delete process.env.GROQ_API_KEY; else process.env.GROQ_API_KEY = cheiVechi.q;
-
-// ── termenele de asteptare ────────────────────────────────────────────────────
-// Timpul simtit de om nu vine din cat raspunde modelul, ci din cat se asteapta unul
-// care NU raspunde. Regula: renunti repede cat timp mai ai pe cine cadea.
+// ── lantul de rezerve, acum construit pentru Mastra ───────────────────────────
+// `providers.js` a plecat: nu mai scriem noi apelul catre Gemini sau Groq. Ce a ramas
+// in mana noastra e ORDINEA — ce model se incearca, cu ce reglaje si cu cate
+// reincercari — fiindca ea decide timpul simtit de om cand primul cade din cota.
+//
+// Ce NU se mai poate testa aici, fiindca nu mai exista: termenul scurt per candidat,
+// pauza pe modelul epuizat si memoria raspunsurilor. Mastra alege modelul urmator dupa
+// EROARE, nu dupa ceas.
 {
-  const stub = m => ({ p: { id: 'test', env: null, native: false, url: 'http://x' }, model: m });
-  const termeneDin = async candidati => {
-    ModelClient._pauzat.clear();
-    ModelClient._memorie.clear();
-    const c = new ModelClient(candidati);
-    const vazute = [];
-    c.unApel = async (_c, _s, _u, termen) => { vazute.push(termen); throw new Error('timeout'); };
-    try { await c.cere('sistem', 'cerere', x => x); } catch { /* toate au tăcut */ }
-    ModelClient._pauzat.clear();
-    return vazute;
-  };
+  const cheiVechi = { g: process.env.GEMINI_API_KEY, q: process.env.GROQ_API_KEY };
+  const olVechi = process.env.OLLAMA_MODEL, urlVechi = process.env.OLLAMA_URL;
+  // fara Ollama in joc, lantul e doar cel cu chei — asa testul nu depinde de masina
+  process.env.OLLAMA_REZERVA = '0';
 
-  const trei = await termeneDin([stub('a'), stub('b'), stub('c')]);
-  const S = ModelClient.TIMEOUT_SCURT_MS;
-  ok(trei.length === 3 && trei[0] === S && trei[1] === S && trei[2] === undefined,
-     `termene: ${trei.map(t => t ?? 'întreg').join(', ')} — scurt cât mai e o rezervă`);
+  const idul = c => (typeof c.model === 'object' && c.model.id) || String(c.model);
 
-  // Regula era doar pentru PRIMA încercare, și asta lăsa jumătate din problemă pe masă:
-  // două modele mute la rând costau 4s + 9s, deși al treilea răspundea în 900ms.
-  ok(trei[1] !== undefined, 'și a doua încercare renunță repede, dacă mai e un candidat');
+  process.env.GEMINI_API_KEY = 'test';
+  delete process.env.GROQ_API_KEY;
+  const doarGemini = await lantModele();
+  ok(doarGemini.every(c => idul(c).startsWith('google/')),
+     'cu o singură cheie, toți candidații sunt la același provider');
+  ok(idul(doarGemini[0]) === 'google/gemini-2.5-flash',
+     'primul e cel mai rapid model măsurat, nu cel mai mare');
+  ok(doarGemini.length === REZERVE.length,
+     `toate rezervele Gemini intră în lanț: ${doarGemini.length}`);
 
-  const unul = await termeneDin([stub('unic')]);
-  ok(unul.length === 1 && unul[0] === undefined,
-     'cu un singur candidat termenul rămâne întreg: a renunța repede = a nu primi nimic');
+  // cheia veche a proiectului merge mai departe: se trece explicit în configurația
+  // modelului, deci nu trebuie redenumită în .env pentru routerul Mastra
+  ok(doarGemini.every(c => c.model.apiKey === 'test'),
+     'GEMINI_API_KEY ajunge la model fără să fie mutată în GOOGLE_API_KEY');
 
-  ok(S <= 2000, `termenul scurt e ${S}ms — o dată și jumătate cel mai lent răspuns bun măsurat`);
+  process.env.GROQ_API_KEY = 'test';
+  const amandoua = await lantModele();
+  const ids = amandoua.map(idul);
+  ok(ids[0].startsWith('google/') && ids.some(i => i.startsWith('groq/')),
+     'cu două chei, lanțul trece la Groq după ce se termină modelele Gemini');
+  ok(ids.findLastIndex(i => i.startsWith('google/')) < ids.findIndex(i => i.startsWith('groq/')),
+     'toate rezervele Gemini se încearcă înaintea schimbării de provider');
+
+  // gandirea oprita: masurat 892ms fata de 1512ms, pe acelasi raspuns
+  const gandire = c => c.providerOptions && c.providerOptions.google
+    && c.providerOptions.google.thinkingConfig.thinkingBudget;
+  ok(gandire(amandoua[0]) === 0, 'primul model Gemini pornește cu gândirea oprită');
+  ok(amandoua.filter(c => idul(c).startsWith('google/')).some(c => gandire(c) === undefined),
+     'modelele care resping parametrul nu-l primesc degeaba');
+  ok(!amandoua.some(c => idul(c).startsWith('groq/') && gandire(c) !== undefined),
+     'reglajul e al Google, nu pleacă la ceilalți provideri');
+
+  // Plafonul de ieșire e nesigur DOAR acolo unde gândirea merge și nu poate fi oprită:
+  // tokenii ei se scad din același buget și taie JSON-ul în două. Măsurat: cu 120 de
+  // tokeni și gândirea pornită au ieșit 96 de gânduri și un răspuns retezat la jumătate.
+  // Ceilalți provideri nu gândesc, deci la ei plafonul e sigur fără niciun parametru.
+  const google = amandoua.filter(c => idul(c).startsWith('google/'));
+  ok(google.every(c => gandire(c) === 0
+        ? c.modelSettings.maxOutputTokens === 200
+        : c.modelSettings.maxOutputTokens === undefined),
+     'la Google, plafonul de ieșire însoțește doar modelele cu gândirea oprită');
+  ok(amandoua.filter(c => !idul(c).startsWith('google/'))
+        .every(c => c.modelSettings.maxOutputTokens === 200),
+     'la ceilalți provideri plafonul se pune oricum: acolo nu se gândește');
+  ok(amandoua.every(c => c.modelSettings.temperature === 0),
+     'temperatura 0 peste tot: același prompt dă același DSL');
+
+  // „renunți repede cât timp mai ai pe cine cădea", cât se mai poate exprima
+  ok(amandoua.slice(0, -1).every(c => c.maxRetries === 0),
+     'niciun model nu se reîncearcă atâta timp cât lanțul are pe cine cădea');
+  ok(amandoua[amandoua.length - 1].maxRetries > 0,
+     'ultimul insistă — după el nu mai urmează nimeni');
+
+  // Ollama, ultima rezervă — ȘI când există o cheie. Până la migrare cele două se
+  // excludeau: modelul local intra în lanț doar când nu exista nicio cheie.
+  delete process.env.OLLAMA_REZERVA;
+  process.env.OLLAMA_MODEL = 'llama3.2';        // scurtcircuitează proba de rețea
+  const cuLocal = await lantModele();
+  const ultim = cuLocal[cuLocal.length - 1];
+  ok(idul(ultim) === 'ollama/llama3.2', 'cu Ollama pornit, el încheie lanțul');
+  ok(ultim.model.url.endsWith('/v1'),
+     'intră ca model „compatibil OpenAI", cu adresa locală scrisă pe față');
+  ok(cuLocal.filter(c => idul(c).startsWith('ollama/')).length === 1,
+     '...o singură dată, nu câte una la fiecare provider');
+
+  process.env.OLLAMA_REZERVA = '0';
+  const stins = await lantModele();
+  ok(!stins.some(c => idul(c).startsWith('ollama/')),
+     'OLLAMA_REZERVA=0 îl scoate din lanț: se cade direct pe parserul local');
+
+  // „oprit": proba pică, iar lanțul rămâne exact cum era. Memoria e ținută pe GAZDĂ,
+  // deci un port mort e o gazdă nouă — testul nu depinde de ce rulează pe mașină.
+  delete process.env.OLLAMA_REZERVA;
+  delete process.env.OLLAMA_MODEL;
+  process.env.OLLAMA_URL = 'http://127.0.0.1:1';        // nimeni nu ascultă acolo
+  const t0 = Date.now();
+  const faraLocal = await lantModele();
+  const probaMs = Date.now() - t0;
+  ok(!faraLocal.some(c => idul(c).startsWith('ollama/')),
+     'fără Ollama, lanțul rămâne doar pe modelele cu cheie');
+  ok(probaMs < 2000, `...iar proba nu ține cererea pe loc: ${probaMs}ms`);
+
+  const t1 = Date.now();
+  await lantModele();
+  ok(Date.now() - t1 < 100, 'un Ollama absent nu se mai probează la fiecare cerere');
+
+  // fără nicio cheie și fără model local, tăcerea trebuie să fie explicită
+  delete process.env.GEMINI_API_KEY;
+  delete process.env.GROQ_API_KEY;
+  let faraNimic = false;
+  try { await lantModele(); } catch { faraNimic = true; }
+  ok(faraNimic, 'fără cheie și fără Ollama, lanțul spune limpede că nu are ce încerca');
+
+  if (olVechi === undefined) delete process.env.OLLAMA_MODEL; else process.env.OLLAMA_MODEL = olVechi;
+  if (urlVechi === undefined) delete process.env.OLLAMA_URL; else process.env.OLLAMA_URL = urlVechi;
+  if (cheiVechi.g === undefined) delete process.env.GEMINI_API_KEY; else process.env.GEMINI_API_KEY = cheiVechi.g;
+  if (cheiVechi.q === undefined) delete process.env.GROQ_API_KEY; else process.env.GROQ_API_KEY = cheiVechi.q;
+}
+
+// ── schema pleacă la model, nu doar în proza promptului ───────────────────────
+// Înainte, forma minificată trăia doar în documentația din prompt și în speranța că
+// modelul o respectă. Acum e o schemă Zod trimisă API-ului ca JSON Schema.
+{
+  const chei = s => Object.keys(s.shape);
+  ok(chei(IESIRE_GEOM).join(',') === 'g,n,y', 'geometrul cere exact g, n, y');
+  ok(chei(IESIRE_TEXT).join(',') === 't,n,y', 'tipograful cere exact t, n, y');
+  ok(chei(IESIRE_CASETA).join(',') === 't,n,y', 'casetarul cere exact t, n, y');
+  ok(!chei(IESIRE_GEOM).includes('t'), 'schema geometrului nu are unde să pună text');
+  ok(!chei(IESIRE_TEXT).includes('g'), 'schema tipografului nu are unde să pună o figură');
+
+  // cheile sunt de UN caracter, ca DSL-ul minificat — asta se plătește în tokeni
+  const scurte = s => chei(s).every(k => k.length === 1);
+  ok(scurte(IESIRE_GEOM) && scurte(IESIRE_TEXT) && scurte(IESIRE_CASETA),
+     'toate cheile de nivel înalt au un singur caracter');
+
+  // schema chiar respinge ce nu e în domeniu, nu doar documentează
+  ok(IESIRE_GEOM.safeParse({ g: { o: 'r', w: 50, h: 50 } }).success, 'o operație validă trece schema');
+  ok(!IESIRE_GEOM.safeParse({ g: { o: 'poligon' } }).success,
+     'o operație care nu există în domeniu e respinsă de schemă, înainte de citire');
+  ok(IESIRE_GEOM.safeParse({ g: null }).success, '„nu e treaba mea" e un răspuns valid');
+  ok(IESIRE_GEOM.safeParse({ g: [{ o: 'r', w: 1, h: 1 }, { o: 'c' }] }).success,
+     'lista de pași trece: o cerere poate înșirui mai multe operații');
 }
 
 // ── memoria raspunsurilor ─────────────────────────────────────────────────────
-// La temperatura 0, acelasi prompt pe aceeasi scena da acelasi DSL, deci a doua
-// oara nu mai are rost cerut. Cheia trebuie sa prinda ORICE schimbare.
-ModelClient._memorie.clear();
-const k1 = ModelClient.cheie('m', 'sistem', 'cerere');
-ok(k1 === ModelClient.cheie('m', 'sistem', 'cerere'), 'aceeași intrare dă aceeași cheie');
-ok(k1 !== ModelClient.cheie('m', 'sistem', 'alta cerere'), 'altă cerere → altă cheie');
-ok(k1 !== ModelClient.cheie('m', 'alt sistem', 'cerere'), 'alt prompt de sistem → altă cheie');
-ok(k1 !== ModelClient.cheie('n', 'sistem', 'cerere'), 'alt model → altă cheie');
-ok(ModelClient.cheie('m', 'ab' + 'X'.repeat(400), 'c') !== ModelClient.cheie('m', 'ba' + 'X'.repeat(400), 'c'),
-   'o schimbare la ÎNCEPUTUL promptului lung schimbă cheia');
+// La temperatura 0, acelasi prompt pe aceeasi scena da acelasi DSL, deci a doua oara nu
+// mai are rost cerut. Verificarea se face INAINTE de orice agent: un tur repetat nu
+// construieste graful si nu atinge reteaua. Cheia trebuie sa prinda ORICE schimbare.
+{
+  MEM.uita();
+  const stare = { noduri: [{ i: 0, nume: 'SQUARE', w: 150, h: 150, at: { x: 100, y: 250 } }],
+                  texte: [], parent: {} };
+  const alta  = { noduri: [{ i: 0, nume: 'PATRAT', w: 300, h: 300, at: { x: 100, y: 250 } }],
+                  texte: [], parent: {} };
+  const k = (p, st, doar) => MEM.cheie(p, LLM.buildUser(p, st), doar);
 
-let apeluri = 0;
-const cm = new ModelClient([per(fals, 'm')]);
-cm.unApel = async () => { apeluri++; return { text: '{"g":{"o":"c"}}', usage: { in: 100, out: 5 } }; };
-const p1 = await cm.cere('sys', 'user', b => JSON.parse(b));
-const p2 = await cm.cere('sys', 'user', b => JSON.parse(b));
-ok(apeluri === 1, 'a doua cerere identică nu mai ajunge la model');
-ok(p2.memorat === true && p2.usage.in === 0 && p2.usage.out === 0,
-   'răspunsul memorat e marcat și nu costă tokeni');
-ok(JSON.stringify(p1.rezultat) === JSON.stringify(p2.rezultat), 'rezultatul e același');
-await cm.cere('sys', 'ALTĂ cerere', b => JSON.parse(b));
-ok(apeluri === 2, 'o cerere diferită chiar ajunge la model');
+  ok(k('mareste', stare) === k('mareste', stare), 'aceeași cerere pe aceeași scenă dă aceeași cheie');
+  ok(k('mareste', stare) !== k('mareste', alta), 'o figură de altă mărime e altă cheie');
+  ok(k('mareste', stare) !== k('micsoreaza', stare), 'alt cuvânt în cerere e altă cheie');
+  ok(k('mareste', stare) !== k('mareste', stare, 'panza'),
+     'aceeași cerere din caseta pânzei e altă cheie: rutarea diferă, deci și răspunsul');
 
-// un raspuns care nu trece de validare NU se tine minte
-let stricat = 0;
-const cs = new ModelClient([per(fals, 'm')]);
-cs.unApel = async () => { stricat++; return { text: 'nu e json', usage: { in: 1, out: 1 } }; };
-try { await cs.cere('s', 'u', b => JSON.parse(b)); } catch { /* asteptat */ }
-try { await cs.cere('s', 'u', b => JSON.parse(b)); } catch { /* asteptat */ }
-ok(stricat === 2, 'un răspuns invalid nu se ține minte — se cere din nou');
-ModelClient._memorie.clear();
+  // ordinea CONTEAZĂ: memoria taie înaintea agenților, nu după ei. Semănăm un răspuns
+  // și cerem același tur — dacă ar chema agenții, ar da peste rețea și ar dura.
+  const inventat = { dsl: { geom: { op: 'clear' }, text: null, why: 'inventat' },
+                     agenti: ['geometrie'], sectiuni: ['modifica'], detalii: [],
+                     provider: 'test', model: 'niciunul' };
+  MEM.tineMinte(k('sterge tot', stare), inventat);
+  const t0 = Date.now();
+  const r = await LLM.askModel('sterge tot', stare);
+  const ms = Date.now() - t0;
+  ok(r.memorat === true, 'un tur repetat se raportează ca venit din memorie');
+  ok(r.dsl.why === 'inventat', '...și chiar întoarce DSL-ul ținut minte, nu unul nou');
+  ok(r.usage.in === 0 && r.usage.out === 0, '...cu consum ZERO: turul n-a costat niciun token');
+  ok(r.incercari === 0, '...și fără nicio încercare: niciun agent nu a fost trezit');
+  ok(ms < 100, `...instantaneu, fără rețea: ${ms}ms`);
+  ok(r.model === 'niciunul' && r.provider === 'test',
+     'providerul raportat e cel care a răspuns ATUNCI, nu cel activ acum');
 
-// harta nu creste la nesfarsit
-const vechi = ModelClient.MEMORIE_MAX;
-ModelClient.MEMORIE_MAX = 3;
-for (let i = 0; i < 6; i++) ModelClient.tineMinte('k' + i, 'v');
-ok(ModelClient._memorie.size === 3, 'memoria e plafonată');
-ok(!ModelClient._memorie.has('k0') && ModelClient._memorie.has('k5'),
-   'cele mai vechi intrări ies primele');
-ModelClient.MEMORIE_MAX = vechi;
-ModelClient._memorie.clear();
+  // plafonul: cele mai vechi ies primele
+  MEM.uita();
+  for (let i = 0; i < MEM.MEMORIE_MAX + 5; i++) MEM.tineMinte('k' + i, inventat);
+  ok(MEM.cate() === MEM.MEMORIE_MAX, `memoria e plafonată la ${MEM.MEMORIE_MAX}`);
+  ok(MEM.adu('k0') === undefined && MEM.adu('k' + (MEM.MEMORIE_MAX + 4)) !== undefined,
+     'cele mai vechi intrări ies primele');
+
+  // o intrare folosită din nou trece la coadă: nu iese doar fiindcă e veche
+  MEM.uita();
+  MEM.tineMinte('vechi', inventat);
+  for (let i = 0; i < MEM.MEMORIE_MAX - 1; i++) MEM.tineMinte('n' + i, inventat);
+  MEM.adu('vechi');
+  MEM.tineMinte('inca-una', inventat);
+  ok(MEM.adu('vechi') !== undefined,
+     'o intrare cerută recent supraviețuiește: plafonul scoate ce nu se mai folosește');
+  MEM.uita();
+}
+
+{
+  // Schema e scrisă pe RAMURI
+
+  // Schema e scrisă pe RAMURI, nu ca un obiect plat cu multe câmpuri opționale.
+  // Măsurat pe gemini-2.5-flash: forma plată pierdea „h" și punctul și inventa
+  // „x":false; discriminarea pe operație dă răspunsul corect. Testul ține forma.
+  const ramuri = IESIRE_GEOM.shape.g.unwrap().options[0].options;
+  ok(Array.isArray(ramuri) && ramuri.length === 6,
+     `„g" e o uniune cu o ramură pe operație: ${ramuri.length} ramuri`);
+  ok(IESIRE_GEOM.safeParse({ g: { o: 'c' } }).success,
+     'o operație fără parametri rămâne validă: „șterge tot" nu cere dimensiuni');
+  // ramura taierii n-are câmp de punct, deci un „p" strecurat nu supraviețuiește
+  const taiere = IESIRE_GEOM.parse({ g: { o: 's', n: 3, d: 'v', p: [1, 2] } });
+  ok(taiere.g.n === 3 && taiere.g.p === undefined,
+     'un câmp din altă ramură e aruncat: fiecare operație are exact câmpurile ei');
+  // iar o valoare de tip greșit chiar pică, nu e reparată în tăcere
+  ok(!IESIRE_GEOM.safeParse({ g: { o: 'r', w: 'trei sute' } }).success,
+     'o dimensiune scrisă în litere e respinsă de schemă');
+
+  // Cine trimite schema la model e o CONSTATARE, nu o preferință: se pune abia după ce
+  // forma a fost verificată pe modelul real. Vezi comentariul din agenti.ts.
+  ok(GEOMETRU.schemaLaModel === true, 'geometria trimite schema: verificată pe Gemini');
+  ok(TIPOGRAF.schemaLaModel === false && CASETAR.schemaLaModel === false,
+     'textul și caseta merg pe prompt până când schema lor e verificată la fel');
+}
+
 
 // promptul fiecărui agent nu conține domeniul celorlalți
 const promptGeo = LLM.promptAgent('geometrie');
@@ -1049,7 +1154,7 @@ ok(est(promptCas) < est(promptTxt),
 
 
 const state = {
-  noduri: [{ i: 0, id: 'o1', nume: 'PATRAT', w: 150, h: 150, at: { x: 100, y: 250 } },
+  noduri: [{ i: 0, id: 'o1', nume: 'SQUARE', w: 150, h: 150, at: { x: 100, y: 250 } },
            { i: 1, id: 'o2', nume: 'DREPTUNGHI', w: 300, h: 150, at: { x: 500, y: 500 } }],
   texte: [{ i: 0, cuvinte: ['MIAU'], pe: 0, at: { x: 100, y: 250 }, sel: false },
           { i: 1, cuvinte: ['ALFA'], pe: null, at: { x: 400, y: 400 }, sel: false }],
@@ -1065,7 +1170,7 @@ ok(/T1 ALFA liber @400,400/.test(user), 'un text fără figură își dă poziț
 ok(!/#2/.test(user), 'textul liber NU consumă un număr de figură');
 console.log('  --- ce pleacă efectiv spre model ---');
 console.log(user.split('\n').map(l => '  ' + l).join('\n'));
-ok(est(user) < 45, `descrierea stării: ${est(user)} tokeni pentru 2 figuri și 2 texte`);
+ok(est(user) < 65, `descrierea stării: ${est(user)} tokeni pentru 2 figuri și 2 texte`);
 ok(!user.includes('|'), 'codul de atribute NU pleacă spre model — e cheia catalogului, locală');
 
 const c = TM.compare({
@@ -1433,7 +1538,7 @@ console.log('\n=== 11. pânza: gabarit variabil și restrângerea în cadru ==='
   ok(V({ g: { op: 'canvas_resize', w: 300, h: 300 } }, 'geometrie').geom.op === 'canvas_resize',
      'și forma lungă trece prin același validator');
   const absurd = V({ g: { o: 'p', w: 99999, h: -5 } }, 'geometrie').geom;
-  ok(absurd.w === CANVAS_PX && absurd.h === 1,
+  ok(absurd.w === PANZA_MAX && absurd.h === 1,
      `dimensiunile absurde se plafonează la validare: ${absurd.w}x${absurd.h}`);
   ok(V({ g: { o: 'p' } }, 'geometrie').geom.w === undefined,
      'fără dimensiuni nu se inventează una: motorul cere mărimea');
@@ -1892,6 +1997,1113 @@ console.log('\n=== 13. vectorul de centre: ținta „în mijlocul figurii N" ===
     ok(app.scena.obiecte[0].centru.x === snap[0].centru.x
        && app.scena.obiecte[0].centru.y === snap[0].centru.y, '...și restaurarea îl pune la loc');
   }
+}
+
+// ─────────────────────────────────────────────────────────── 14. mutarea cu mouse-ul
+console.log('\n=== 14. mutarea cu mouse-ul: click, tragere, Undo ===');
+
+// Până acum singurul fel de a muta ceva era promptul, iar o așezare văzută cu ochiul —
+// „mai la stânga cu puțin" — cerea o cerere întreagă către model, pentru o operație
+// care n-are nimic de tradus. Tragerea o face local, gratis. Ce se verifică aici e că
+// nu strică nimic din ce ținea deja: Σ len, cadrul pânzei și un Undo pe gest.
+{
+  const IM = await import(B + 'interaction/InputManager.js');
+
+  // --- ținta de sub cursor, ca funcție pură: scena desenată plus un punct
+  const desen = {
+    edges: [{ id: 'a', x1: 100, y1: 100, x2: 300, y2: 100, obj: 'o1' }],
+    words: [{ i: 0, x: 500, y: 500, size: 17, obj: 'o2' }],
+    casete: [{ x: 600, y: 100, w: 120, h: 60, obj: 'o3' }],
+  };
+  ok(IM.gaseste(desen, 200, 104) === 'o1', 'click pe contur nimerește figura');
+  ok(IM.gaseste(desen, 505, 505) === 'o2', 'click pe cuvânt nimerește textul lui');
+  ok(IM.gaseste(desen, 660, 130) === 'o3', 'click ÎN casetă o nimerește, și unde nu scrie nimic');
+  ok(IM.gaseste(desen, 660, 165) === 'o3', '...și la câțiva pixeli sub ea, cât ține pragul');
+  ok(IM.gaseste(desen, 400, 400) === null, 'click în gol nu nimerește nimic');
+  ok(IM.gaseste({ edges: [{ ...desen.edges[0], ghost: true }] }, 200, 104) === null,
+     'o muchie-fantomă nu e țintă: e pe cale să dispară');
+  ok(IM.gaseste({ edges: [], words: [{ ...desen.words[0], size: 0 }] }, 500, 500) === null,
+     'un cuvânt necrescut nu e țintă');
+}
+
+{
+  const { App } = await import(B + 'core/App.js');
+  let DSL = null;
+  globalThis.fetch = async url => ({
+    ok: true,
+    json: async () => (String(url).includes('status')
+      ? { provider: 'stub', model: 'stub' }
+      : { dsl: DSL, model: 'stub', usage: { in: 0, out: 0 }, ms: 0, agenti: ['text'] }),
+  });
+
+  const cadru = () => ({ w: SC.panza.w, h: SC.panza.h, pad: 6 });
+  /** Centrele cuvintelor, așa cum se DESENEAZĂ — singurul lucru pe care îl vede omul. */
+  const centre = o => layout(o.figure, o.stream, o.binds, cadru()).words
+    .map(w => App.centruCuvant(w, o.stream.advance[w.i] || 0))
+    .map(p => ({ x: Math.round(p.x), y: Math.round(p.y) }));
+
+  // --- apucarea: ce ține degetul trebuie să fie selectat până începe mutarea
+  const app = new App();
+  app.scena.clear();
+  app.scena.setPanza(CANVAS_PX, CANVAS_PX);
+  const a = app.plaseaza({ op: 'rect', w: 200, h: 100 }, { x: 400, y: 400 });
+  const b = app.plaseaza({ op: 'rect', w: 100, h: 100 }, { x: 700, y: 700 });
+
+  ok(!app.selectie.size, 'o figură nou creată nu rămâne selectată');
+  app.apuca(a.id, false);
+  ok(app.selectie.size === 1 && app.selectie.has(a.id), 'apăsarea pe o figură o selectează');
+
+  app.select(b.id, true);
+  ok(app.selectie.size === 2, 'Shift adaugă la selecție');
+  app.apuca(a.id, false);
+  ok(app.selectie.size === 2,
+     'apăsarea pe un obiect DEJA selectat nu strică selecția: se mută toate odată');
+
+  // --- tragerea: doar translație, pe toată selecția
+  const lungA = a.figure.totalLength(), lungB = b.figure.totalLength();
+  const bbA = a.figure.bbox(), bbB = b.figure.bbox();
+  app.incepeMutarea();
+  app.mutaSelectia(30, -20);
+
+  const dupaA = a.figure.bbox(), dupaB = b.figure.bbox();
+  ok(Math.round(dupaA.minX - bbA.minX) === 30 && Math.round(dupaA.minY - bbA.minY) === -20,
+     'tragerea mută figura exact cu deplasarea cursorului');
+  ok(Math.round(dupaB.minX - bbB.minX) === 30 && Math.round(dupaB.minY - bbB.minY) === -20,
+     '...și pe a doua din selecție la fel, cu același gest');
+  ok(Math.abs(a.figure.totalLength() - lungA) < 1e-9
+     && Math.abs(b.figure.totalLength() - lungB) < 1e-9,
+     'mutarea nu atinge nicio lungime: Σ len rămâne neschimbat');
+  ok(app.actualizeazaCentre()[0].x === Math.round(400 + 30)
+     && app.actualizeazaCentre()[0].y === Math.round(400 + 20),
+     'centrul raportat urmează figura: y logic crește în SUS, deci o tragere în sus îl mărește');
+
+  // --- cadrul pânzei: cursorul poate merge mai departe, obiectul se oprește la ramă
+  app.mutaSelectia(500, 0);
+  ok(b.figure.bbox().maxX <= SC.panza.w - 6 + 1e-6,
+     'tragerea nu scoate nimic din pânză: obiectul se oprește la ramă');
+
+  // --- Undo: un singur pas pentru tot gestul, nu unul pe cadru
+  const inapoi = app.history.undo(app.scena.snapshot());
+  app.scena.restore(inapoi, (w, f) => app.faceStream(w, f));
+  ok(Math.round(app.scena.obiecte[0].figure.bbox().minX) === Math.round(bbA.minX)
+     && Math.round(app.scena.obiecte[1].figure.bbox().minX) === Math.round(bbB.minX),
+     'Undo desface tragerea întreagă, nu ultimul pixel din ea');
+
+  // --- textul agățat de PÂNZĂ: fără punct al lui, o translație n-ar avea ce muta
+  const app2 = new App();
+  app2.scena.clear();
+  app2.scena.setPanza(CANVAS_PX, CANVAS_PX);
+  DSL = { geom: null, text: { set: ['SALUT'] } };
+  await app2.run('scrie SALUT');
+  const t = app2.scena.obiecte[0];
+  t.binds = t.binds.map(() => ({ bind: 'corner', at: 'tl' }));
+
+  const eraLa = centre(t);
+  app2.ancoreaza(t);
+  ok(JSON.stringify(centre(t)) === JSON.stringify(eraLa),
+     'desprinderea din colț nu mișcă textul cu niciun pixel');
+  ok(t.binds.every(x => x.bind === 'point' && x.at && typeof x.at === 'object'),
+     '...dar de-acum are un punct al lui, care se poate muta');
+
+  app2.selectie.clear(); app2.selectie.add(t.id);
+  app2.mutaSelectia(40, 25);
+  const acum = centre(t);
+  ok(acum[0].x - eraLa[0].x === 40 && acum[0].y - eraLa[0].y === 25,
+     'iar tragerea îl duce exact cu cât s-a tras');
+
+  // --- textul legat de un CONTUR nu are nevoie de ancoră: urmează figura
+  const app3 = new App();
+  app3.scena.clear();
+  app3.scena.setPanza(CANVAS_PX, CANVAS_PX);
+  app3.plaseaza({ op: 'rect', w: 300, h: 200 }, { x: 400, y: 400 });
+  DSL = { geom: null, text: { set: ['MIAU'], bind: 'inside' }, target: [0] };
+  await app3.run('scrie MIAU in figura');
+  const f = app3.scena.obiecte[0];
+  const textEraLa = centre(f);
+  app3.selectie.clear(); app3.selectie.add(f.id);
+  app3.incepeMutarea();
+  app3.mutaSelectia(-60, 45);
+  const textAcum = centre(f);
+  ok(textAcum[0].x - textEraLa[0].x === -60 && textAcum[0].y - textEraLa[0].y === 45,
+     'un text legat de contur se trage odată cu figura, fără nicio ancoră');
+  ok(f.binds.every(x => (typeof x === 'string' ? x : x.bind) === 'inside'),
+     '...iar legarea lui rămâne cea de contur, nu se preface în punct');
+}
+
+// ─────────────────────────────────────────────────────────── 15. incadrarea
+console.log('\n=== 15. dreptunghi de selecție: mai multe obiecte dintr-un gest ===');
+
+// Shift-click adună obiectele unul câte unul. Cadrul le ia pe toate odată — și e
+// singurul fel în care poți prinde ce e împrăștiat pe pânză fără să numeri click-uri.
+// Ce se verifică: ce atinge cadrul, ce NU atinge, și că grupul strâns așa se mută
+// ca unul singur.
+{
+  const IM = await import(B + 'interaction/InputManager.js');
+
+  ok(JSON.stringify(IM.dreptunghi(300, 200, 100, 50)) === JSON.stringify(IM.dreptunghi(100, 50, 300, 200)),
+     'cadrul iese la fel tras în orice direcție: colțurile se ordonează singure');
+
+  const desen = {
+    edges: [
+      { id: 'a', x1: 100, y1: 100, x2: 200, y2: 100, obj: 'o1' },
+      { id: 'b', x1: 600, y1: 600, x2: 700, y2: 600, obj: 'o2' },
+    ],
+    words: [{ i: 0, text: 'MIAU', x: 400, y: 400, size: 17, align: 'center', baseline: 'middle', obj: 'o3' }],
+    casete: [{ x: 500, y: 100, w: 100, h: 50, obj: 'o4' }],
+  };
+  const cuprinse = (x, y, w, h) => [...IM.cuprinse(desen, { x, y, w, h })].sort().join(',');
+
+  ok(cuprinse(50, 50, 200, 200) === 'o1', 'cadrul prinde figura pe care o atinge');
+  ok(cuprinse(0, 0, 800, 800) === 'o1,o2,o3,o4', 'un cadru peste toată pânza le prinde pe toate');
+  ok(cuprinse(380, 390, 40, 20) === 'o3', 'un cuvânt e prins de dreptunghiul lui, nu de un punct');
+  ok(cuprinse(560, 120, 20, 20) === 'o4', 'caseta e prinsă și pe unde nu scrie nimic');
+  ok(cuprinse(250, 250, 100, 100) === '', 'un cadru tras prin gol nu prinde nimic');
+  ok(IM.cuprinse({ edges: [{ ...desen.edges[0], ghost: true }] }, { x: 0, y: 0, w: 800, h: 800 }).size === 0,
+     'muchiile-fantomă rămân în afara selecției');
+}
+
+{
+  const { App } = await import(B + 'core/App.js');
+  globalThis.fetch = async url => ({
+    ok: true,
+    json: async () => (String(url).includes('status') ? { provider: 'stub', model: 'stub' } : {}),
+  });
+
+  const app = new App();
+  app.scena.clear();
+  app.scena.setPanza(CANVAS_PX, CANVAS_PX);
+  const a = app.plaseaza({ op: 'rect', w: 200, h: 100 }, { x: 400, y: 400 });   // canvas: x 300..500, y 350..450
+  const b = app.plaseaza({ op: 'rect', w: 100, h: 100 }, { x: 700, y: 700 });   // canvas: x 650..750, y  50..150
+  app.draw(true);
+
+  // --- ce atinge cadrul intră în selecție, chiar în timpul tragerii
+  app.incepeCadru(false);
+  app.intindeCadru({ x: 250, y: 300, w: 300, h: 200 });
+  ok(app.selectie.size === 1 && app.selectie.has(a.id),
+     'cadrul prinde doar figura pe care o atinge, nu și pe cea de alături');
+  ok(app.scene.cadru && app.scene.cadru.w === 300,
+     'dreptunghiul se vede pe pânză cât timp e tras');
+  ok(app.scene.edges.some(e => e.obj === a.id && e.sel) && app.scene.edges.every(e => e.obj !== b.id || !e.sel),
+     'evidențierea e cea de la click: se vede DIN TIMPUL tragerii ce va fi prins');
+
+  // --- micșorat înapoi, obiectul iese din selecție: se poate corecta fără să ridici degetul
+  app.intindeCadru({ x: 250, y: 300, w: 20, h: 20 });
+  ok(!app.selectie.size, 'un cadru strâns la loc lasă selecția goală: gestul e reversibil');
+
+  app.intindeCadru({ x: 250, y: 300, w: 300, h: 200 });
+  app.terminaCadru();
+  ok(app.selectie.size === 1 && app.scene.cadru === null,
+     'la ridicarea butonului dreptunghiul dispare, selecția rămâne');
+
+  // --- Shift: cadrul ADAUGĂ la ce era deja selectat
+  app.incepeCadru(true);
+  app.intindeCadru({ x: 600, y: 0, w: 200, h: 200 });
+  app.terminaCadru();
+  ok(app.selectie.size === 2 && app.selectie.has(a.id) && app.selectie.has(b.id),
+     'cu Shift, al doilea cadru adaugă la selecție în loc să o înlocuiască');
+
+  app.select(null, true);
+  ok(app.selectie.size === 2, 'un click în gol cu Shift nu dărâmă selecția construită');
+
+  // --- grupul strâns cu cadrul se mută ca unul singur
+  const bbA = a.figure.bbox(), bbB = b.figure.bbox();
+  const lungA = a.figure.totalLength();
+  app.incepeMutarea();
+  app.mutaSelectia(-40, 30);
+  ok(Math.round(a.figure.bbox().minX - bbA.minX) === -40
+     && Math.round(b.figure.bbox().minX - bbB.minX) === -40,
+     'tragerea mută tot grupul prins cu cadrul, cu aceeași deplasare');
+  ok(Math.round(a.figure.bbox().minY - bbA.minY) === 30
+     && Math.round(b.figure.bbox().minY - bbB.minY) === 30,
+     '...pe amândouă axele, deodată');
+  ok(Math.abs(a.figure.totalLength() - lungA) < 1e-9,
+     'și aici mutarea e doar translație: Σ len rămâne neatins');
+
+  const inapoi = app.history.undo(app.scena.snapshot());
+  app.scena.restore(inapoi, (w, f) => app.faceStream(w, f));
+  ok(Math.round(app.scena.obiecte[0].figure.bbox().minX) === Math.round(bbA.minX)
+     && Math.round(app.scena.obiecte[1].figure.bbox().minX) === Math.round(bbB.minX),
+     'un Undo desface mutarea întregului grup, nu obiect cu obiect');
+
+  app.select(null, false);
+  ok(!app.selectie.size, 'un click simplu în gol deselectează, ca până acum');
+}
+
+// ===========================================================================================
+// 16. MARGINEA OPRESTE TOATA SELECTIA, NU DOAR FIGURA CARE O ATINGE
+// ===========================================================================================
+//
+// Restrans obiect cu obiect — asa se facea, cu „restrangeToate" dupa fiecare pas de mutare —
+// cel ajuns la margine se oprea, iar celalalt mergea mai departe dupa cursor. Doua figuri
+// trase impreuna spre aceeasi muchie se strangeau una in alta si ramaneau in linie, desi
+// gestul fusese o translatie. Distanta dintre ele nu trebuie sa se schimbe niciodata.
+console.log('\n=== 16. marginea oprește toată selecția, nu doar figura care o atinge ===');
+{
+  const { App } = await import(B + 'core/App.js');
+  globalThis.fetch = async url => ({
+    ok: true,
+    json: async () => (String(url).includes('status') ? { provider: 'stub', model: 'stub' } : {}),
+  });
+
+  const PAD = 6;                                        // respiroul cerut de marginea pânzei
+  const app = new App();
+  app.scena.clear();
+  app.scena.setPanza(CANVAS_PX, CANVAS_PX);
+  const a = app.plaseaza({ op: 'rect', w: 100, h: 100 }, { x: 700, y: 400 });   // canvas: x 650..750
+  const b = app.plaseaza({ op: 'rect', w: 100, h: 100 }, { x: 200, y: 400 });   // canvas: x 150..250
+  app.draw(true);
+  app.selectie = new Set([a.id, b.id]);
+
+  const distanta = () => a.figure.bbox().minX - b.figure.bbox().minX;
+  const departe = distanta();                           // 500px între ele, atât trebuie să rămână
+  const lungB = b.figure.totalLength();
+
+  // --- tras spre dreapta mai mult decât încape: se face doar cât intră, pe amândouă
+  app.incepeMutarea();
+  app.mutaSelectia(200, 0);
+  ok(Math.round(a.figure.bbox().maxX) === CANVAS_PX - PAD,
+     'figura din față se oprește exact pe muchie');
+  ok(Math.round(distanta()) === Math.round(departe),
+     'cea din spate se oprește odată cu ea: distanța dintre figuri rămâne cea de la început');
+
+  // --- de aici încolo, în direcția aceea nu mai mișcă nimic
+  const inainte = b.figure.bbox().minX;
+  app.mutaSelectia(80, 0);
+  ok(Math.round(b.figure.bbox().minX) === Math.round(inainte),
+     'cu marginea atinsă, figura îndepărtată nu mai înaintează spre ea');
+  ok(Math.round(distanta()) === Math.round(departe), '...și distanța tot nu se schimbă');
+
+  // --- axa liberă rămâne liberă: pe lângă margine selecția alunecă, întreagă
+  const sus = { a: a.figure.bbox().minY, b: b.figure.bbox().minY };
+  app.mutaSelectia(80, 30);
+  ok(Math.round(a.figure.bbox().minY - sus.a) === 30
+     && Math.round(b.figure.bbox().minY - sus.b) === 30,
+     'blocat pe o axă, grupul se mută normal pe cealaltă');
+  ok(Math.round(a.figure.bbox().maxX) === CANVAS_PX - PAD
+     && Math.round(distanta()) === Math.round(departe),
+     '...fără să miște nimic pe axa blocată');
+  ok(Math.abs(b.figure.totalLength() - lungB) < 1e-9,
+     'oprirea la margine e tot translație: Σ len rămâne neatins');
+
+  app.terminaMutarea();
+
+  // --- aceeași margine ține și pentru o figură singură, ca până acum
+  app.selectie = new Set([b.id]);
+  app.incepeMutarea();
+  app.mutaSelectia(-900, 0);
+  ok(Math.round(b.figure.bbox().minX) === PAD,
+     'o figură trasă singură se oprește tot pe muchie, nu iese din pânză');
+  app.terminaMutarea();
+}
+
+// ===========================================================================================
+// 17. MAI MULTE OPERAȚII DINTR-UN SINGUR PROMPT
+// ===========================================================================================
+//
+// Până acum o cerere aducea o singură operație: „fă două pătrate" cerea două prompturi,
+// adică două drumuri la model pentru ceva spus o dată. Acum „g" poate fi o LISTĂ de pași,
+// aplicați pe rând, ca și cum ar fi fost ceruți separat — dar cu un singur Undo peste tot.
+console.log('\n=== 17. mai multe operații dintr-un singur prompt ===');
+
+// --- validarea listei, la agentul de geometrie
+{
+  const geo = GEOMETRU;
+  const doi = geo.citeste({ g: [{ o: 'r', w: 100, h: 100, p: [200, 200] },
+                                  { o: 'r', w: 300, h: 150, p: [600, 600] }] });
+  ok(Array.isArray(doi) && doi.length === 2, 'campul „g" poate fi o listă de operații');
+  ok(doi[0].op === 'rect' && doi[0].w === 100 && doi[1].w === 300,
+     'fiecare pas trece prin aceeași validare ca una singură');
+  ok(doi[0].at.x === 200 && doi[1].at.y === 600, 'fiecare pas își păstrează punctul lui');
+
+  ok(geo.citeste({ g: { o: 'r', w: 100, h: 100 } }).op === 'rect',
+     'o cerere obișnuită rămâne un obiect, nu o listă');
+  ok(geo.citeste({ g: [{ o: 'r', w: 100, h: 100 }] }).op === 'rect',
+     'o listă de un singur pas se strânge tot la obiect: restul codului nu vede nicio schimbare');
+
+  const curat = geo.citeste({ g: [{ o: 'r', w: 50, h: 50 }, { o: 'HACK' }, null, 'nu'] });
+  ok(!Array.isArray(curat) && curat.op === 'rect',
+     'pașii pe care motorul nu-i cunoaște se aruncă, ceilalți rămân');
+  ok(geo.citeste({ g: [{ o: 'HACK' }, { o: 'NIMIC' }] }) === null,
+     'o listă din care nu rămâne nimic e ca și cum n-ar fi fost geometrie');
+
+  const multi = geo.citeste({ g: Array.from({ length: 20 }, () => ({ o: 'r', w: 10, h: 10 })) });
+  ok(multi.length === MAX_PASI,
+     'lanțul se taie la ' + MAX_PASI + ' pași: o cerere, nu un program');
+}
+
+// --- rezerva locală: aceleași cereri, fără model
+{
+  const doua = PP.parse('fa 2 patrate de 100').geom;
+  ok(Array.isArray(doua) && doua.length === 2 && doua[0].w === 100,
+     '„fa 2 patrate de 100" dă doi pași, nu unul');
+  ok(PP.parse('creeaza doua patrate de 100').geom.length === 2,
+     'numărul scris în litere se citește la fel');
+
+  const lant = PP.parse('fa un patrat de 100 la 200,200 si un dreptunghi de 300 pe 150 la 600,600').geom;
+  ok(lant.length === 2 && lant[0].w === 100 && lant[1].w === 300 && lant[1].h === 150,
+     'două figuri diferite, înșiruite cu „și", ies ca doi pași');
+  ok(lant[0].at.x === 200 && lant[1].at.x === 600, 'fiecare cu punctul lui');
+
+  ok(PP.parse('fa un dreptunghi de 300 pe 150').geom.op === 'rect',
+     'o singură figură rămâne o singură operație');
+
+  // „și" nu taie orice: bucata trebuie să fie ea însăși un pas de geometrie
+  const text = PP.parse('scrie ALFA si BETA');
+  ok(text.geom === null && text.text.set.join(' ') === 'ALFA BETA',
+     '„scrie ALFA si BETA" rămâne un singur text cu două cuvinte, nu două cereri');
+  const mixt = PP.parse('fa un patrat de 100 si scrie MIAU');
+  ok(!Array.isArray(mixt.geom) && mixt.geom.w === 100 && mixt.text.set[0] === 'MIAU',
+     'figură plus text: tot un pas de geometrie, textul merge pe lângă');
+
+  ok(PP.parse('fa 2 patrate').error, 'fără dimensiune se spune, nu se inventează');
+}
+
+// --- aplicarea pe scenă
+{
+  const { App } = await import(B + 'core/App.js');
+  let DSL = null;
+  globalThis.fetch = async url => ({
+    ok: true,
+    json: async () => (String(url).includes('status')
+      ? { provider: 'stub', model: 'stub' }
+      : { dsl: DSL, model: 'stub', usage: { in: 0, out: 0 }, ms: 0, agenti: ['geometrie'] }),
+  });
+  const app = new App();
+  const ruleaza = async (prompt, dsl) => { DSL = dsl; await app.run(prompt); };
+  const gabarit = i => {
+    const b = app.figuri()[i].figure.bbox();
+    return { w: Math.round(b.maxX - b.minX), h: Math.round(b.maxY - b.minY) };
+  };
+
+  await ruleaza('fa un patrat de 100 la 200,200 si un dreptunghi de 300 pe 150 la 600,600', {
+    geom: [{ op: 'rect', w: 100, h: 100, at: { x: 200, y: 200 } },
+           { op: 'rect', w: 300, h: 150, at: { x: 600, y: 600 } }],
+    text: null,
+  });
+  ok(app.figuri().length === 2, 'un singur prompt, două figuri');
+  ok(gabarit(0).w === 100 && gabarit(1).w === 300 && gabarit(1).h === 150,
+     'fiecare pas și-a păstrat dimensiunea cerută');
+  ok(app.payload().noduri[0].at.x === 200 && app.payload().noduri[1].at.x === 600,
+     'și punctul lui');
+  ok(app.scena.obiecte.every(o => o.figure.totalLength() > 0), 'fiecare obiect nou are Σ len');
+
+  // un Undo desface CEREREA, nu ultimul ei pas: instantaneul se ia o dată, înainte de lanț
+  const inapoi = app.history.undo(app.scena.snapshot());
+  app.scena.restore(inapoi, (w, f) => app.faceStream(w, f));
+  ok(app.scena.obiecte.length === 0, 'un Undo desface tot lanțul, nu doar ultimul pas');
+
+  // --- fără puncte: pașii nu se calcă unul pe altul
+  await ruleaza('fa doua patrate de 100', {
+    geom: [{ op: 'rect', w: 100, h: 100 }, { op: 'rect', w: 100, h: 100 }],
+    text: null,
+  });
+  ok(app.figuri().length === 2, 'două pătrate fără punct: tot două figuri');
+  const [a, b] = app.figuri().map(o => o.figure.bbox());
+  const peste = a.minX < b.maxX && b.minX < a.maxX && a.minY < b.maxY && b.minY < a.maxY;
+  ok(!peste, 'al doilea își caută loc liber, nu se așază peste primul');
+  ok(gabarit(0).w === 100 && gabarit(1).w === 100,
+     'iar primul rămâne cum a fost făcut: în lanț, „rect" creează, nu remodelează');
+
+  // --- lanț mixt: creare, apoi o operație pe ce s-a creat
+  app.scena.clear();
+  await ruleaza('fa un patrat de 200 la 400,400 apoi imparte-l in 2', {
+    geom: [{ op: 'rect', w: 200, h: 200, at: { x: 400, y: 400 } },
+           { op: 'split', into: 2, dir: 'v' }],
+    text: null,
+  });
+  ok(app.scena.obiecte.length === 1 && app.figuri()[0].figure.polylines.length === 2,
+     'pasul al doilea lucrează pe ce a născut primul');
+
+  // --- o singură operație se poartă exact ca înainte: „fă-l de …" remodelează
+  app.scena.clear();
+  await ruleaza('fa un patrat de 200 la 400,400',
+                { geom: { op: 'rect', w: 200, h: 200, at: { x: 400, y: 400 } }, text: null });
+  await ruleaza('fa-l de 300 pe 100', { geom: { op: 'rect', w: 300, h: 100 }, text: null });
+  ok(app.figuri().length === 1 && gabarit(0).w === 300 && gabarit(0).h === 100,
+     'un „rect" singur, fără punct, remodelează figura de pe pânză — ca până acum');
+}
+
+// nota de suprapunere: numărată înainte de așezare, altfel figura nouă se găsea pe sine
+{
+  const { App } = await import(B + 'core/App.js');
+  const app = new App();
+  app.scena.clear();
+  const patrat = { op: 'rect', w: 100, h: 100, at: { x: 300, y: 300 } };
+
+  const prima = [];
+  app.aplicaGeom(patrat, prima, null);
+  ok(!prima.some(n => /suprapuse/.test(n)),
+     'prima figură pe o pânză goală nu se raportează suprapusă peste nimic');
+
+  const adoua = [];
+  app.aplicaGeom(patrat, adoua, null);
+  ok(adoua.some(n => /^1 suprapuse/.test(n)), 'una chiar peste alta se spune, o dată');
+}
+
+// ===========================================================================================
+// 18. CASETA DINTR-UN BUTON, NU DINTR-UN PROMPT
+// ===========================================================================================
+//
+// Ambalarea unui text era numai o cerere de prompt — „pune textul într-o casetă" — adică un
+// drum la model pentru o comandă care n-are nimic de tradus: ce text, se știe din selecție.
+// Butonul o face local, gratis, și face și drumul invers.
+console.log('\n=== 18. caseta dintr-un buton, nu dintr-un prompt ===');
+{
+  const { App } = await import(B + 'core/App.js');
+  let DSL = null;
+  globalThis.fetch = async url => ({
+    ok: true,
+    json: async () => (String(url).includes('status')
+      ? { provider: 'stub', model: 'stub' }
+      : { dsl: DSL, model: 'stub', usage: { in: 0, out: 0 }, ms: 0, agenti: ['text'] }),
+  });
+  const app = new App();
+  const ruleaza = async (prompt, dsl) => { DSL = dsl; await app.run(prompt); };
+  /** Casetele DESENATE — singurul lucru pe care îl vede omul. */
+  const casete = () => app.scene.casete.length;
+  const undeScrie = () => app.scene.words.map(w => ({ x: Math.round(w.x), y: Math.round(w.y) }));
+
+  await ruleaza('fa un patrat de 300 la 400,400',
+                { geom: { op: 'rect', w: 300, h: 300, at: { x: 400, y: 400 } }, text: null });
+  await ruleaza('scrie MIAU in patrat',
+                { geom: null, text: { set: ['MIAU'], bind: 'inside' } });
+  const fig = app.figuri()[0];
+
+  ok(!casete(), 'la început textul n-are casetă');
+  ok(!App.inCaseta(fig), '...nici legarea lui nu spune altceva');
+
+  // --- selectez figura cu textul și apăs butonul
+  app.selectie = new Set([fig.id]);
+  ok(app.texteVizate().length === 1, 'selecția are un text de ambalat: butonul e aprins');
+  app.comutaCaseta();
+  ok(casete() === 1, 'o apăsare bagă textul în casetă, fără niciun prompt');
+  ok(App.inCaseta(fig), 'legarea chiar a devenit „box"');
+
+  // --- a doua apăsare îl scoate, și îl lasă unde se vedea
+  const inainte = undeScrie();
+  app.comutaCaseta();
+  ok(!casete(), 'a doua apăsare îl scoate din casetă');
+  ok(!App.inCaseta(fig), '...și legarea nu mai e „box"');
+  ok(fig.binds.every(b => b === 'inside'),
+     'pe o figură textul se întoarce înăuntrul ei, unde ar fi stat oricum');
+  const dupa = undeScrie();
+  ok(dupa.length === inainte.length
+     && dupa.every((p, i) => Math.abs(p.x - inainte[i].x) < 60 && Math.abs(p.y - inainte[i].y) < 60),
+     'scos din casetă, textul rămâne aproximativ unde se vedea, nu sare în colț');
+
+  // --- un Undo desface apăsarea întreagă
+  app.comutaCaseta();
+  ok(casete() === 1, 'pus la loc în casetă');
+  const inapoi = app.history.undo(app.scena.snapshot());
+  app.scena.restore(inapoi, (w, f) => app.faceStream(w, f));
+  app.draw(true);
+  ok(!casete(), 'un Undo desface apăsarea, ca orice altă schimbare');
+
+  // --- text LIBER: n-are contur de care să se agațe, deci rămâne legat de punctul lui
+  app.scena.clear();
+  app.selectie.clear();
+  await ruleaza('scrie ALFA', { geom: null, text: { set: ['ALFA'], bind: 'inside' } });
+  const liber = app.scena.obiecte[0];
+  app.selectie = new Set([liber.id]);
+  const inainteLiber = undeScrie();
+  app.comutaCaseta();
+  ok(casete() === 1, 'și un text liber intră în casetă dintr-o apăsare');
+  app.comutaCaseta();
+  ok(liber.binds.every(b => b && b.bind === 'point'),
+     'scos, un text fără figură rămâne legat de PUNCT, nu de un contur care nu există');
+  const dupaLiber = undeScrie();
+  ok(dupaLiber.every((p, i) => Math.abs(p.x - inainteLiber[i].x) < 60
+                            && Math.abs(p.y - inainteLiber[i].y) < 60),
+     '...și nu pleacă în (0,0), colțul pânzei');
+
+  // --- fără text pe pânză nu e ce ambala: butonul nu face nimic
+  app.scena.clear();
+  app.selectie.clear();
+  ok(!app.texteVizate().length, 'pânză fără text: butonul se stinge');
+  const inainteGol = JSON.stringify(app.scena.snapshot());
+  app.comutaCaseta();
+  ok(JSON.stringify(app.scena.snapshot()) === inainteGol,
+     'apăsarea pe gol nu schimbă nimic');
+
+  // --- fără selecție cade pe tot, ca orice comandă fără țintă
+  await ruleaza('scrie UNU', { geom: null, text: { set: ['UNU'], bind: 'inside' } });
+  await ruleaza('scrie DOI', { geom: null, text: { set: ['DOI'], bind: 'inside' } });
+  app.selectie.clear();
+  ok(app.texteVizate().length === 2, 'fără selecție, butonul privește toate textele');
+  app.comutaCaseta();
+  ok(casete() === 2, 'și le bagă pe amândouă în câte o casetă, dintr-o apăsare');
+}
+
+// ===========================================================================================
+// 19. PÂNZA CREȘTE PÂNĂ LA 1200, DAR PORNEȘTE TOT DE LA 800
+// ===========================================================================================
+//
+// Pornirea și plafonul stăteau în aceeași constantă — `CANVAS_PX`, „gabaritul maxim, și cel
+// de pornire". Sunt însă două lucruri: cât e comod să înceapă și cât se poate cere. Testele
+// de mai jos verifică granița dintre ele, pe tot drumul: validare, motor, catalog.
+console.log('\n=== 19. pânza crește până la 1200, pornește de la 800 ===');
+{
+  const { App } = await import(B + 'core/App.js');
+  let DSL = null;
+  globalThis.fetch = async url => ({
+    ok: true,
+    json: async () => (String(url).includes('status')
+      ? { provider: 'stub', model: 'stub' }
+      : { dsl: DSL, model: 'stub', usage: { in: 0, out: 0 }, ms: 0, agenti: ['geometrie'] }),
+  });
+  const app = new App();
+  const ruleaza = async (prompt, dsl, doar) => { DSL = dsl; await app.run(prompt, doar); };
+
+  ok(SC.panza.w === CANVAS_PX && SC.panza.h === CANVAS_PX,
+     `aplicația pornește cu pânza de ${CANVAS_PX}×${CANVAS_PX}`);
+
+  // --- creșterea până la plafon
+  await ruleaza('fa panza 1200 pe 1200',
+                { geom: { op: 'canvas_resize', w: 1200, h: 1200 }, text: null }, 'panza');
+  ok(SC.panza.w === PANZA_MAX && SC.panza.h === PANZA_MAX,
+     `o pânză cerută de ${PANZA_MAX}×${PANZA_MAX} chiar se face atât`);
+  // gabaritul pânzei intră în scenă, deci ajunge la element prin animație; instantaneu,
+  // ca să se poată citi acum
+  app.draw(true);
+  ok(app.renderer.w === PANZA_MAX,
+     'și elementul de desen o urmează: nu rămâne la gabaritul vechi');
+
+  // --- pe pânza crescută, punctele de peste 800 sunt bune
+  ok(inCanvas(1100, 1100), 'un punct la 1100,1100 e pe pânză acum');
+  await ruleaza('fa un patrat de 200 la 1100,1100',
+                { geom: { op: 'rect', w: 200, h: 200, at: { x: 1100, y: 1100 } }, text: null });
+  ok(app.figuri().length === 1, 'o figură cerută acolo chiar se creează');
+  const b = app.figuri()[0].figure.bbox();
+  ok(b.maxX <= PANZA_MAX && b.minY >= 0, '...și e adusă în pânză, ca oricare alta');
+
+  // --- o figură mai mare decât pânza de pornire e o cerere cinstită acum
+  app.scena.clear();
+  await ruleaza('fa un patrat de 1000 la 600,600',
+                { geom: { op: 'rect', w: 1000, h: 1000, at: { x: 600, y: 600 } }, text: null });
+  const mare = app.figuri()[0].figure.bbox();
+  ok(Math.round(mare.maxX - mare.minX) === 1000,
+     'o figură de 1000px nu mai e tăiată la 800: pe pânza asta încape');
+  ok(CAT.code(app.figuri()[0].figure.signature()).split('|')[1] === '20',
+     '...iar catalogul îi dă lățimea adevărată, 20 de celule');
+
+  // --- peste plafon nu se trece, și se spune
+  const note = [];
+  app.aplicaGeom({ op: 'canvas_resize', w: 5000, h: 5000 }, note);
+  ok(SC.panza.w === PANZA_MAX,
+     `o cerere de 5000 se oprește la ${PANZA_MAX}, nu crește la nesfârșit`);
+  ok(note.some(n => n.includes(String(PANZA_MAX))),
+     'plafonarea se spune pe față, cu cifra: nu se întâmplă în tăcere');
+
+  // --- și înapoi la pornire, fără urme
+  await ruleaza('fa panza 800 pe 800',
+                { geom: { op: 'canvas_resize', w: 800, h: 800 }, text: null }, 'panza');
+  ok(SC.panza.w === CANVAS_PX && !inCanvas(1100, 1100),
+     'micșorată la loc, un punct la 1100 nu mai e pe pânză');
+  app.scena.clear();
+}
+
+// ===========================================================================================
+// 20. UN TEXT NOU E AL PÂNZEI, NU AL FIGURII DE PE EA
+// ===========================================================================================
+//
+// Cu o singură figură goală pe pânză, ea era singura țintă implicită, așa că orice text nou
+// ajungea legat „inside" de ea: se desena în mijlocul figurii și se muta odată cu ea. Dar un
+// text nou nu e al figurii care se întâmplă să fie desenată — e al pânzei. Cade în mijlocul
+// ei, la gabaritul de ACUM, și rămâne obiect de sine stătător, cu numărul lui.
+//
+// Cine îl vrea înăuntru o poate cere pe față („în pătrat"), poate numi figura, sau poate da
+// click pe ea înainte — toate trei rămân neatinse.
+console.log('\n=== 20. un text nou e al pânzei, nu al figurii de pe ea ===');
+{
+  const { App } = await import(B + 'core/App.js');
+  let DSL = null;
+  globalThis.fetch = async url => ({
+    ok: true,
+    json: async () => (String(url).includes('status')
+      ? { provider: 'stub', model: 'stub' }
+      : { dsl: DSL, model: 'stub', usage: { in: 0, out: 0 }, ms: 0, agenti: ['text'] }),
+  });
+  const app = new App();
+  const ruleaza = async (prompt, dsl, doar) => { DSL = dsl; await app.run(prompt, doar); };
+  const rect = (w, h, x, y) => ({ geom: { op: 'rect', w, h, at: { x, y } }, text: null });
+  const scrie = (cuv, extra) => ({ geom: null, text: { set: [cuv], bind: 'inside', ...extra } });
+  const liber = () => app.payload().texte.filter(t => t.pe === null);
+  const peFiguri = () => app.payload().texte.filter(t => t.pe !== null);
+
+  app.scena.clear();
+  app.scena.setPanza(CANVAS_PX, CANVAS_PX);
+
+  // --- o figură goală pe pânză: textul nu se lipește de ea
+  await ruleaza('fa un patrat de 200 la 200,600', rect(200, 200, 200, 600));
+  await ruleaza('scrie MIAU', scrie('MIAU'));
+  ok(liber().length === 1 && !peFiguri().length,
+     'cu o figură pe pânză, textul nou rămâne obiect liber, nu al ei');
+  ok(!app.figuri()[0].stream.words.length, 'figura chiar n-a primit niciun cuvânt');
+  ok(liber()[0].at.x === CANVAS_PX / 2 && liber()[0].at.y === CANVAS_PX / 2,
+     `și cade în mijlocul pânzei: (${liber()[0].at.x},${liber()[0].at.y})`);
+
+  // --- mijlocul e al pânzei de ACUM, nu al celei de pornire
+  app.scena.clear();
+  await ruleaza('fa panza 400 pe 300',
+                { geom: { op: 'canvas_resize', w: 400, h: 300 }, text: null }, 'panza');
+  await ruleaza('fa un patrat de 80 la 100,80', rect(80, 80, 100, 80));
+  await ruleaza('scrie MIAU', scrie('MIAU'));
+  ok(SC.panza.w === 400 && SC.panza.h === 300, 'pânza s-a micșorat la 400×300');
+  ok(liber().length === 1 && liber()[0].at.x === 200 && liber()[0].at.y === 150,
+     `mijlocul se socotește din gabaritul de acum: (${liber()[0].at.x},${liber()[0].at.y})`);
+
+  // --- conturul nu mai împinge textul deoparte: mijlocul cerut e chiar mijlocul
+  app.scena.clear();
+  await ruleaza('fa panza 800 pe 800',
+                { geom: { op: 'canvas_resize', w: 800, h: 800 }, text: null }, 'panza');
+  await ruleaza('fa un patrat de 300 la 400,400', rect(300, 300, 400, 400));
+  await ruleaza('scrie MIAU', scrie('MIAU'));
+  ok(liber().length === 1 && liber()[0].at.x === 400 && liber()[0].at.y === 400,
+     'o figură chiar în centru nu mai mută textul din centru — poziția e a pânzei');
+
+  // --- dar două TEXTE tot nu se calcă: acolo așezătorul rămâne la treabă
+  await ruleaza('scrie BETA', scrie('BETA'));
+  const doua = liber();
+  ok(doua.length === 2, 'al doilea text e tot obiect propriu, nu un rând sub primul');
+  ok(doua[0].at.x !== doua[1].at.x || doua[0].at.y !== doua[1].at.y,
+     `și se ferește de primul: (${doua[0].at.x},${doua[0].at.y}) vs (${doua[1].at.x},${doua[1].at.y})`);
+
+  // --- cererea care NUMEȘTE figura o primește, ca până acum
+  app.scena.clear();
+  await ruleaza('fa un patrat de 200 la 400,400', rect(200, 200, 400, 400));
+  await ruleaza('scrie MIAU in patrat', scrie('MIAU'));
+  ok(peFiguri().length === 1 && !liber().length,
+     'cerut pe față — „în pătrat" — textul chiar intră în figură');
+
+  // --- la fel, cu ținta dată de model
+  app.scena.clear();
+  await ruleaza('fa un patrat de 200 la 400,400', rect(200, 200, 400, 400));
+  await ruleaza('scrie MIAU', { ...scrie('MIAU'), target: [0] });
+  ok(peFiguri().length === 1, 'o țintă numită de model bate regula: textul e al figurii #0');
+
+  // --- și cu figura aleasă prin click
+  app.scena.clear();
+  await ruleaza('fa un patrat de 200 la 400,400', rect(200, 200, 400, 400));
+  app.selectie = new Set([app.figuri()[0].id]);
+  await ruleaza('scrie MIAU', scrie('MIAU'));
+  ok(peFiguri().length === 1, 'figura selectată cu click primește textul, ca înainte');
+  app.selectie.clear();
+
+  // --- „în fiecare" cere copierea, deci se copiază
+  app.scena.clear();
+  await ruleaza('fa un patrat de 100 la 200,200', rect(100, 100, 200, 200));
+  await ruleaza('fa un patrat de 100 la 600,600', rect(100, 100, 600, 600));
+  await ruleaza('scrie MIAU in fiecare figura', { geom: null, text: { set: ['MIAU'], bind: 'inside' } });
+  ok(peFiguri().length === 2 && !liber().length,
+     '„în fiecare figură" pune câte unul în amândouă — copierea chiar s-a cerut');
+
+  // --- același tur creează figura ȘI scrie: textul e tot al pânzei
+  app.scena.clear();
+  await ruleaza('fa un patrat de 200 la 400,400 si scrie MIAU',
+                { geom: { op: 'rect', w: 200, h: 200, at: { x: 400, y: 400 } },
+                  text: { set: ['MIAU'], bind: 'inside' } });
+  ok(app.figuri().length === 1 && !app.figuri()[0].stream.words.length,
+     'figura tocmai creată rămâne fără text');
+  ok(liber().length === 1 && liber()[0].at.x === 400 && liber()[0].at.y === 400,
+     'textul cerut în același tur e obiect propriu, în mijlocul pânzei');
+
+  // --- dar dacă cererea spune „în pătrat", tot acolo ajunge
+  app.scena.clear();
+  await ruleaza('fa un patrat de 200 la 400,400 si scrie MIAU in patrat',
+                { geom: { op: 'rect', w: 200, h: 200, at: { x: 400, y: 400 } },
+                  text: { set: ['MIAU'], bind: 'inside' } });
+  ok(peFiguri().length === 1 && !liber().length,
+     '...cerut pe față, textul intră în figura creată în același tur');
+
+  // --- un text nou peste unul liber care există deja: tot obiect separat, ca înainte
+  app.scena.clear();
+  await ruleaza('scrie ALFA', scrie('ALFA'));
+  await ruleaza('scrie BETA', scrie('BETA'));
+  ok(liber().length === 2, 'pe pânza goală, două prompturi dau două texte, nu unul lung');
+
+  app.scena.clear();
+  app.scena.setPanza(CANVAS_PX, CANVAS_PX);
+}
+
+// ─────────────────────────────────────────── 21. scena ca date: salvare și încărcare
+//
+// `continut_json` din baza de date se scrie de aici și se citește tot de aici, deci
+// forma trebuie să supraviețuiască unui `JSON.stringify` întreg — nu doar să pară că o
+// face. Testele de mai jos țin trei lucruri deodată:
+//
+//   1. dus-întorsul e fidel: figuri, cuvinte, legări, pânză, Σ len
+//   2. datele care vin din afară nu pot dărâma aplicația — un rând corupt dă o pânză
+//      mai săracă, nu o excepție
+//   3. seriile locale sesiunii (id-uri de obiect, numere de text) se refac, ca o pânză
+//      încărcată să nu se ciocnească cu ce se desenează după ea
+console.log('\n=== 21. scena ca date: salvare și încărcare ===');
+{
+  const faceStream = (w, f) => new TextStream(w, ctx, f);
+  const scena = new SC.Scene();
+  scena.setPanza(400, 300);
+
+  const t1 = SC.nextText(), t2 = SC.nextText();
+  const o1 = scena.add(new SC.Obiect(dreptunghi(120, 80), { x: 200, y: 150 },
+                                     faceStream(['ALFA', 'BETA'], 17)));
+  o1.binds = ['inside', { bind: 'side', at: 'top', in: true }];
+  o1.texte = [t1, t1];
+  const o2 = scena.add(new SC.Obiect(Figure.empty(), { x: 60, y: 240 },
+                                     faceStream(['LIBER'], 21)));
+  o2.binds = [{ bind: 'point', at: { x: 60, y: 60 }, rot: 90 }];
+  o2.texte = [t2];
+
+  const sumaVeche = scena.totalLength();
+
+  // --- de ce nu se poate salva `snapshot`: gabaritul stă ca PROPRIETATE pe listă, iar
+  // `JSON.stringify` a unei liste nu scrie decât elementele indexate. S-ar pierde tăcut.
+  ok(JSON.parse(JSON.stringify(scena.snapshot())).panza === undefined,
+     'instantaneul de Undo pierde pânza la serializare — de asta există toJSON');
+  ok(SC.FORMAT === 1, `forma salvată își spune versiunea: v${SC.FORMAT}`);
+
+  // --- dus-întorsul trece printr-un șir, ca prin baza de date, nu prin același obiect
+  const salvat = JSON.parse(JSON.stringify(scena.toJSON()));
+  ok(salvat.panza.w === 400 && salvat.panza.h === 300,
+     'pânza chiar ajunge în date: 400×300');
+  ok(salvat.obiecte.length === 2, 'ambele obiecte sunt scrise');
+
+  SC.panza.w = CANVAS_PX; SC.panza.h = CANVAS_PX;      // altă sesiune, altă pânză
+  const noua = new SC.Scene();
+  const n = noua.incarca(salvat, faceStream);
+
+  ok(n === 2 && noua.length === 2, 'se încarcă exact cele două obiecte');
+  ok(SC.panza.w === 400 && SC.panza.h === 300,
+     'pânza se pune ÎNAINTEA obiectelor: ele sunt în pixelii ei');
+  ok(Math.abs(noua.totalLength() - sumaVeche) < 1e-9,
+     `Σ len trece neatins prin salvare: ${Math.round(sumaVeche)}`);
+
+  const [n1, n2] = noua.obiecte;
+  ok(n1.at.x === 200 && n1.at.y === 150, 'punctul de așezare se păstrează');
+  ok(n1.stream.words.join() === 'ALFA,BETA' && n1.stream.fontPx === 17,
+     'cuvintele și corpul de literă se păstrează');
+  ok(n1.figure.polylines.length === 1 && n1.figure.polylines[0].segs.length === 4,
+     'figura se reconstruiește cu toate laturile');
+  ok(n1.figure instanceof Figure && typeof n1.figure.bbox === 'function',
+     'și e o Figure vie, nu date inerte: are metodele ei');
+  ok(n1.binds[0] === 'inside', 'legarea simplă rămâne șir — nu se umflă degeaba');
+  ok(n1.binds[1].bind === 'side' && n1.binds[1].at === 'top' && n1.binds[1].in === true,
+     'legarea pe latură își păstrează latura și fața');
+  ok(n2.binds[0].bind === 'point' && n2.binds[0].at.x === 60 && n2.binds[0].rot === 90,
+     'legarea în punct își păstrează punctul și rotația');
+  ok(n2.figure.isEmpty && n2.stream.words.join() === 'LIBER',
+     'un text liber, fără contur, se întoarce tot fără contur');
+
+  // --- seriile locale sesiunii se REFAC, dar ordinea lor nu se schimbă
+  ok(n1.id !== o1.id && n2.id !== o2.id,
+     'id-urile de obiect sunt noi: nu se pot ciocni cu ce se desenează după încărcare');
+  ok(n1.texte[0] > t2 && n2.texte[0] > t2,
+     'numerele de text sunt și ele noi, peste tot ce era în sesiune');
+  ok(n1.texte[0] === n1.texte[1], 'un text rămâne UN text: ambele cuvinte au același număr');
+  ok(n1.texte[0] < n2.texte[0], '...iar ordinea se păstrează: T0 rămâne primul');
+
+  // --- date din afară: nimic nu are voie să arunce
+  const gunoi = [null, undefined, 42, 'text', {}, { obiecte: 'nu e listă' },
+                 { obiecte: [null, 7, {}] }, { panza: { w: 'x', h: null }, obiecte: [] }];
+  let aruncat = 0, obiecteDinGunoi = 0;
+  for (const g of gunoi) {
+    try { obiecteDinGunoi += new SC.Scene().incarca(g, faceStream); } catch { aruncat++; }
+  }
+  ok(aruncat === 0, `${gunoi.length} forme stricate, niciuna nu aruncă`);
+  ok(obiecteDinGunoi === 0, '...și niciuna nu produce obiecte inventate');
+  SC.panza.w = 400; SC.panza.h = 300;
+
+  // --- un rând corupt sărăcește pânza, nu o dărâmă
+  const stricat = JSON.parse(JSON.stringify(salvat));
+  stricat.obiecte[0].figure[0].segs[1].len = 'nu e număr';
+  stricat.obiecte.push({ at: { x: 10, y: 10 } });                 // fără figură și fără cuvinte
+  stricat.obiecte.push({ at: null, words: ['X'] });               // fără punct de așezare
+  const partial = new SC.Scene();
+  ok(partial.incarca(stricat, faceStream) === 2,
+     'obiectele nedesenabile se sar, cele bune rămân');
+  ok(partial.obiecte[0].figure.polylines[0].segs.length === 3,
+     'din figura stricată se păstrează laturile valide, restul se taie');
+
+  // --- legare necunoscută: motorul n-are cum să o deseneze, deci devine cea firească
+  const inventat = { panza: { w: 400, h: 300 },
+                     obiecte: [{ at: { x: 5, y: 5 }, words: ['X'],
+                                 binds: [{ bind: 'teleportare' }], figure: [] }] };
+  const scInv = new SC.Scene();
+  ok(scInv.incarca(inventat, faceStream) === 1,
+     'un obiect fără contur, dar cu text, se încarcă');
+  ok(scInv.obiecte[0].binds[0] === 'inside',
+     'o legare pe care motorul n-o cunoaște cade pe „inside", nu pe ecran');
+
+  // --- pânza salvată se plafonează la citire, ca oricare alta
+  const uriasa = { panza: { w: 9999, h: 9999 }, obiecte: [] };
+  new SC.Scene().incarca(uriasa, faceStream);
+  ok(SC.panza.w === PANZA_MAX && SC.panza.h === PANZA_MAX,
+     `o pânză salvată de 9999 se oprește la ${PANZA_MAX}, ca orice cerere`);
+
+  SC.panza.w = CANVAS_PX; SC.panza.h = CANVAS_PX;
+}
+
+// ────────────────────────── 25. ieșirea din cont, peste toate cele trei origini
+//
+// `signOut()` golește `localStorage`-ul UNEI SINGURE origini. Cu trei porturi sunt trei
+// depozite, fiecare cu sesiunea lui de când i-a fost predată. Ieșirea de pe 8082 lăsa
+// deci poarta, pe 8080, cu sesiunea ei neatinsă: ea o vedea, trimitea înapoi la 8082,
+// iar 8082 trimitea iar la poartă — du-te-vino fără sfârșit.
+//
+// Un lanț greșit nu se vede decât ca buclă în browser, adică exact felul de defect care
+// merită prins altundeva decât cu ochiul. De aceea `lantIesire` e o funcție pură.
+console.log('\n=== 25. ieșirea din cont, peste toate originile ===');
+{
+  const { lantIesire } = await import(B + 'cont/Cont.js');
+  const TOATE = { poarta: 8080, panze: 8082, panza: 8081 };
+
+  // --- de pe fiecare pagină, celelalte se curăță, iar POARTA e ultima
+  const de8082 = lantIesire(TOATE, 8082);
+  ok(de8082.join() === '8081,8080',
+     'ieșire de pe pagina de alegere: întâi pânza, apoi poarta');
+  ok(de8082[de8082.length - 1] === 8080, '...poarta e ULTIMA — acolo se oprește omul');
+
+  const de8081 = lantIesire(TOATE, 8081);
+  ok(de8081.join() === '8082,8080', 'ieșire din pânză: alegerea, apoi poarta');
+
+  const de8080 = lantIesire(TOATE, 8080);
+  ok(de8080.join() === '8081,8082',
+     'ieșire chiar de la poartă: se curăță celelalte două');
+  ok(!de8080.includes(8080), '...și nu se trimite singură la ea însăși — asta era bucla');
+
+  // --- portul curent nu apare niciodată în lanț, oricum ar veni scris
+  for (const p of [8080, '8080', 8081, '8081', 8082, '8082']) {
+    ok(!lantIesire(TOATE, p).includes(Number(p)),
+       `portul de acum (${typeof p} ${p}) nu se curăță pe sine`);
+  }
+
+  // --- instalare cu două containere: lanțul are doar ce există
+  const doua = { poarta: 8080, panza: 8081 };
+  ok(lantIesire(doua, 8081).join() === '8080',
+     'cu două containere, lanțul are un singur pas');
+  ok(lantIesire(doua, 8080).join() === '8081', '...și invers, tot unul');
+
+  // --- un singur container: nu e nimic altundeva de curățat, deci nu se pleacă nicăieri
+  ok(lantIesire({ panza: 8081 }, 8081).length === 0,
+     'cu un singur container, lanțul e gol — nu se navighează în gol');
+  ok(lantIesire({}, 8081).length === 0, 'fără porturi anunțate, lanț gol');
+  ok(lantIesire(null, 8081).length === 0, 'fără hartă deloc, lanț gol — nu aruncă');
+
+  // --- porturi mutate din .env: lanțul le urmează, nu presupune 8080/8081/8082
+  const mutate = { poarta: 9000, panze: 9002, panza: 9001 };
+  ok(lantIesire(mutate, 9002).join() === '9001,9000',
+     'porturile mutate din .env sunt urmate întocmai');
+}
+
+// ─────────────────────────────── 24. rolurile: un proces sau trei containere
+//
+// `porturi.js` e citit de DOUĂ lucruri — serverul și proba de sănătate a containerului.
+// Dacă cele două n-ar fi de acord ce port ascultă un rol, containerul ar apărea
+// „unhealthy" deși merge, iar cauza n-ar fi vizibilă de nicăieri.
+//
+// Funcțiile primesc mediul ca parametru tocmai ca să poată fi verificate aici: un modul
+// deja încărcat n-ar reciti `process.env` dacă l-ar fi citit la import.
+console.log('\n=== 24. rolurile: un proces sau trei containere ===');
+{
+  const P = await import('./porturi.js');
+
+  // --- fără ROL: un proces, toate trei paginile (așa merge `npm start`)
+  ok(P.roluriDeServit({}).join() === 'poarta,panze,panza',
+     'fără ROL, un singur proces servește toate trei paginile');
+  const pt = P.porturi({});
+  ok(pt.poarta === 8080 && pt.panze === 8082 && pt.panza === 8081,
+     `porturile implicite: poarta ${pt.poarta}, panze ${pt.panze}, panza ${pt.panza}`);
+  ok(P.portulMeu({}) === 8080, 'proba de sănătate cade pe poartă când rolurile-s toate');
+
+  // --- cu ROL: un singur rol, pe portul lui
+  for (const [rol, port] of [['poarta', 8080], ['panze', 8082], ['panza', 8081]]) {
+    ok(P.roluriDeServit({ ROL: rol }).join() === rol, `ROL=${rol} servește doar „${rol}"`);
+    ok(P.portulMeu({ ROL: rol }) === port, `...și proba îl caută pe ${port}, nu pe 8080`);
+  }
+
+  // --- numele containerelor merg la fel de bine ca cele din cod
+  ok(P.roluriDeServit({ ROL: 'canvas' })[0] === 'panza', 'ROL=canvas înseamnă „panza"');
+  ok(P.roluriDeServit({ ROL: 'log' })[0] === 'poarta', 'ROL=log înseamnă „poarta"');
+  ok(P.roluriDeServit({ ROL: 'canvas-selection' })[0] === 'panze',
+     'ROL=canvas-selection înseamnă „panze"');
+  ok(P.roluriDeServit({ ROL: '  CANVAS  ' })[0] === 'panza',
+     'spațiile și majusculele nu contează');
+
+  // Un ROL scris greșit ARUNCĂ. Un container care ar servi tăcut altă pagină decât cea
+  // cerută e mai rău decât unul care refuză să pornească și spune de ce.
+  let aruncat = '';
+  try { P.rol({ ROL: 'canvass' }); } catch (e) { aruncat = e.message; }
+  ok(aruncat.includes('canvass') && aruncat.includes('Acceptate'),
+     'un ROL greșit oprește pornirea și enumeră ce se acceptă, în loc să cadă pe un implicit');
+
+  // --- porturile ANUNȚATE: doar rolurile care chiar rulează
+  ok(Object.keys(P.porturiAnuntate({})).join() === 'poarta,panze,panza',
+     'implicit se anunță toate trei');
+  const doua = P.porturiAnuntate({ ROLURI: 'log,canvas' });
+  ok(!('panze' in doua) && doua.poarta === 8080 && doua.panza === 8081,
+     'cu ROLURI=log,canvas pagina de alegere nu mai e anunțată — nimeni nu e trimis acolo');
+  ok(Object.keys(P.porturiAnuntate({ ROLURI: 'inexistent' })).length === 3,
+     'un ROLURI numai cu gunoi cade pe toate trei, nu pe niciunul');
+
+  // --- porturile se pot muta din mediu, iar proba le urmează
+  const mutat = { ROL: 'canvas', PORT_PANZA: '9091' };
+  ok(P.porturi(mutat).panza === 9091 && P.portulMeu(mutat) === 9091,
+     'un port mutat din .env e urmat și de server, și de proba de sănătate');
+  ok(P.porturi({ PORT: '7000' }).poarta === 7000, '`PORT` singur ține locul lui PORT_POARTA');
+
+  // --- fiecare rol are pagina lui, și toate trei există pe disc
+  const fs = await import('node:fs');
+  for (const r of P.ROLURI_TOATE) {
+    ok(fs.existsSync(P.PAGINI[r]), `rolul „${r}" servește ${P.PAGINI[r]}, care există`);
+  }
+}
+
+// ─────────────────────────────────── 23. regulile formularului de cont nou
+//
+// Sunt funcții pure, deci se pot proba fără browser — și tocmai de aia stau într-un
+// modul separat, nu într-un `onclick`. O regulă de parolă scrisă direct în pagină nu se
+// poate verifica, deci se strică tăcut la prima rescriere a formularului.
+//
+// Ce NU dovedesc testele astea: că regulile sunt o apărare. Ele trăiesc în browser, iar
+// browserul e al omului. Impunerea adevărată a parolei stă în Supabase Dashboard, la
+// Authentication → Policies.
+console.log('\n=== 23. regulile de email, nume și parolă ===');
+{
+  const V = await import(B + 'cont/Validare.js');
+
+  // --- emailul: „@" și „.com", cum s-a cerut
+  const emailBun = ['a@gmail.com', 'Raul.Toma@exemplu.com', 'x@sub.domeniu.com'];
+  const emailRau = {
+    'raul': 'fără „@" deloc',
+    'raul@gmail': 'fără „.com"',
+    'raul@gmail.ro': 'alt domeniu de nivel superior',
+    '@gmail.com': 'nimic înainte de „@"',
+    'raul@.com': 'nimic între „@" și punct',
+    'ra ul@gmail.com': 'spațiu în adresă',
+    'a@b@gmail.com': 'două „@"',
+  };
+  for (const e of emailBun) ok(V.verificaEmail(e).bun, `email valid: ${e}`);
+  for (const [e, de] of Object.entries(emailRau)) {
+    const v = V.verificaEmail(e);
+    ok(!v.bun && v.motiv.length > 0, `email respins (${de}): "${e}" → ${v.motiv}`);
+  }
+  ok(V.verificaEmail('  a@gmail.com  ').bun, 'spațiile din jur se taie, nu se resping');
+
+  // --- parola: cel puțin 8 caractere ȘI un caracter special
+  ok(V.PAROLA_MIN === 8, `pragul e ${V.PAROLA_MIN} caractere`);
+  ok(V.verificaParola('parola!1').bun, 'parolă bună: 8 caractere și un „!"');
+  ok(V.verificaParola('Ab1?cdef').bun, '...la fel, cu „?"');
+  ok(!V.verificaParola('parola!').bun, 'șapte caractere: prea scurtă, chiar cu semn');
+  ok(!V.verificaParola('parolalunga').bun, 'lungă, dar fără niciun caracter special');
+  ok(!V.verificaParola('').bun, 'goală: respinsă');
+
+  // Caracterul special e definit prin EXCLUDERE — orice nu e literă, cifră sau spațiu.
+  // O listă scrisă de mână ar respinge tăcut semne dintr-un alt alfabet.
+  ok(V.verificaParola('abcdefg-').bun, 'liniuța e caracter special');
+  ok(V.verificaParola('abcdefg€').bun, '...și „€", deși n-ar fi pe nicio listă scrisă de mână');
+  ok(!V.verificaParola('abcdefgh').bun, 'doar litere: nu');
+  ok(!V.verificaParola('12345678').bun, 'doar cifre: nu');
+  ok(!V.verificaParola('abcdefg ').bun, 'spațiul NU trece drept caracter special');
+  ok(V.verificaParola('parolăé!').bun, 'diacriticele sunt litere, nu semne — dar „!" salvează parola');
+  ok(!V.verificaParola('parolăéà').bun, '...iar fără semn, diacriticele singure nu ajung');
+
+  // Lista de reguli pleacă întreagă, ca formularul să le poată aprinde pe rând
+  const r = V.verificaParola('scurt');
+  ok(r.reguli.length === 2 && r.reguli.every(x => 'text' in x && 'indeplinita' in x),
+     'se întorc toate regulile, nu doar prima picată — formularul le bifează pe rând');
+  ok(r.reguli.filter(x => x.indeplinita).length === 0, '„scurt" nu îndeplinește niciuna');
+  ok(V.verificaParola('scurt!').reguli.filter(x => x.indeplinita).length === 1,
+     '„scurt!" o îndeplinește pe cea de semn, dar nu pe cea de lungime');
+
+  // --- numele de utilizator
+  ok(V.verificaNume('raul').bun, 'nume valid');
+  ok(!V.verificaNume('ra').bun, `sub ${V.NUME_MIN} caractere: respins`);
+  ok(!V.verificaNume('').bun, 'gol: respins');
+  ok(!V.verificaNume('x'.repeat(V.NUME_MAX + 1)).bun, `peste ${V.NUME_MAX}: respins`);
+
+  // --- tot formularul: se raportează primul lucru de reparat, în ordinea de pe ecran
+  ok(V.verificaInregistrare({ email: 'a@gmail.com', nume: 'raul', parola: 'parola!1' }).bun,
+     'formular complet și corect');
+  ok(V.verificaInregistrare({ email: 'gresit', nume: 'ra', parola: 'x' }).motiv
+     === V.verificaEmail('gresit').motiv,
+     'cu mai multe greșeli, se spune prima de pe ecran — emailul, nu parola');
+  ok(V.verificaInregistrare({ email: 'a@gmail.com', nume: 'ra', parola: 'x' }).motiv
+     === V.verificaNume('ra').motiv,
+     '...apoi numele, și abia la urmă parola');
+}
+
+// ─────────────────────────────────────────── 22. poarta: jetonul până la /api/parse
+//
+// Autentificarea nu e doar un ecran. Dacă jetonul nu ajunge pe fir, poarta e o ușă de
+// sticlă: pagina cere cont, dar `/api/parse` răspunde oricui. Iar dacă un 401 s-ar
+// pierde în rezerva locală pe regex, aplicația ar părea că merge fără sesiune.
+console.log('\n=== 22. poarta: jetonul pe fir și sesiunea pierdută ===');
+{
+  const fetchVechi = globalThis.fetch;
+  let antet = null, raspuns = { ok: true, status: 200, dsl: { geom: null, text: { set: ['X'] } } };
+  globalThis.fetch = async (url, opt) => {
+    antet = (opt && opt.headers && opt.headers.Authorization) || null;
+    return {
+      ok: raspuns.ok, status: raspuns.status,
+      json: async () => (raspuns.ok
+        ? { dsl: raspuns.dsl, model: 'stub', usage: { in: 0, out: 0 }, ms: 0, agenti: ['text'] }
+        : { error: 'sesiune invalidă' }),
+    };
+  };
+
+  await PP.parseRemote('scrie X', {}, 'figuri', 'JETONUL-MEU');
+  ok(antet === 'Bearer JETONUL-MEU',
+     'jetonul pleacă spre /api/parse ca „Bearer …" — poarta nu e doar un ecran');
+
+  antet = null;
+  await PP.parseRemote('scrie X', {}, 'figuri');
+  ok(antet === null,
+     'fără cont configurat nu se trimite niciun antet — ruta rămâne deschisă ca înainte');
+
+  // --- 401: sesiunea s-a pierdut. Rezerva locală răspunde, dar codul merge mai departe.
+  raspuns = { ok: false, status: 401 };
+  const pierdut = await PP.parseRemote('scrie X', {}, 'figuri', 'expirat');
+  ok(pierdut._cod === 401,
+     'un 401 se raportează ca atare, nu se pierde în rezerva locală');
+  ok(pierdut._live === false,
+     '...iar răspunsul e marcat ca venit de la regex, nu de la model');
+
+  // --- o pană adevărată de model NU e 401: acolo rezerva locală chiar e răspunsul bun
+  raspuns = { ok: false, status: 503 };
+  const cazut = await PP.parseRemote('scrie X', {}, 'figuri', 'bun');
+  ok(cazut._cod === 503 && cazut._cod !== 401,
+     'o pană de model rămâne 503: cele două nu se confundă, și nu cer același lucru');
+
+  globalThis.fetch = fetchVechi;
+}
+
+// --- integrarea cu App: o încărcare e o schimbare ca oricare alta, deci se desface
+{
+  const { App } = await import(B + 'core/App.js');
+  const app = new App();
+  app.scena.clear();
+  app.scena.setPanza(CANVAS_PX, CANVAS_PX);
+
+  const o = app.scena.add(new SC.Obiect(dreptunghi(200, 100), { x: 400, y: 400 },
+                                        app.faceStream(['UNU'], 17)));
+  o.binds = ['inside'];
+  o.texte = [SC.nextText()];
+  const dinCont = JSON.parse(JSON.stringify(app.scena.toJSON()));
+
+  app.scena.clear();
+  app.selectie.add('o-care-nu-mai-exista');
+  const istoricInainte = app.history.past.length;
+
+  ok(app.incarcaScena(dinCont) === 1, 'App pune pe pânză scena venită din cont');
+  ok(app.scena.obiecte[0].stream.words.join() === 'UNU', '...cu textul ei cu tot');
+  ok(!app.selectie.size, 'selecția veche nu supraviețuiește încărcării');
+  ok(app.history.past.length === istoricInainte + 1,
+     'încărcarea intră în istoric ÎNAINTE să schimbe ceva');
+
+  const inapoi = app.history.undo(app.scena.snapshot());
+  app.scena.restore(inapoi, (w, f) => app.faceStream(w, f));
+  ok(app.scena.length === 0, 'Undo chiar întoarce pânza la ce era înainte de încărcare');
+
+  app.scena.clear();
+  app.scena.setPanza(CANVAS_PX, CANVAS_PX);
 }
 
 console.log(fail ? `\n### ${fail} TESTE PICATE` : '\n### TOATE TESTELE TREC');

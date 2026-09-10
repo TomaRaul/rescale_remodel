@@ -15,6 +15,8 @@ export class CanvasRenderer {
   static CIFRE_TARI = 'rgba(30,41,59,.85)';
   static HALOU = 'rgba(29,78,216,.20)';
   static CASETA = '#64748b';
+  static CADRU = '#1d4ed8';
+  static CADRU_UMPLUT = 'rgba(29,78,216,.07)';
 
   constructor(canvas) {
     this.canvas = canvas;
@@ -34,8 +36,14 @@ export class CanvasRenderer {
     const W = w + m.l + m.r, H = h + m.t + m.b;
     this.canvas.width = W * this.dpr;
     this.canvas.height = H * this.dpr;
+    // Latimea se scrie, inaltimea NU: in CSS elementul are `height:auto`, deci si-o ia
+    // din raportul laturilor pe care il da chiar zona de desen. Scrisa aici, ea ar fi
+    // fost o valoare inline, adica mai tare decat orice regula de stil — iar cand
+    // `max-width:100%` ingusteaza o panza mare, latimea s-ar fi micsorat singura si
+    // desenul ar fi iesit intins pe verticala. Asa, cele doua laturi se strang la fel,
+    // iar `InputManager.punct` are un singur raport de corectat pentru amandoua.
     this.canvas.style.width = W + 'px';
-    this.canvas.style.height = H + 'px';
+    this.canvas.style.removeProperty?.('height');
     this.ctx.setTransform(this.dpr, 0, 0, this.dpr, m.l * this.dpr, m.t * this.dpr);
     this.w = w; this.h = h; this.m = m;
   }
@@ -94,6 +102,24 @@ export class CanvasRenderer {
     c.restore();
   }
 
+  /**
+   * Dreptunghiul de selectie, cat timp e tras cu mouse-ul.
+   *
+   * E o unealta, nu continut: destul cat sa se vada ce cuprinde, prea putin cat sa
+   * acopere desenul.
+   */
+  cadru(c, r) {
+    if (!(r?.w > 0 || r?.h > 0)) return;                  // gest abia inceput: n-are ce desena
+    c.save();
+    c.fillStyle = CanvasRenderer.CADRU_UMPLUT;
+    c.fillRect(r.x, r.y, r.w, r.h);                       // umbra abia vizibila: se vede ce cuprinde
+    c.strokeStyle = CanvasRenderer.CADRU;
+    c.lineWidth = 1;
+    c.setLineDash([4, 3]);                                // intrerupta: e unealta, nu contur de figura
+    c.strokeRect(r.x + .5, r.y + .5, r.w, r.h);
+    c.restore();
+  }
+
   render(scene) {
     const c = this.ctx;
     c.clearRect(-this.m.l, -this.m.t, this.w + this.m.l + this.m.r, this.h + this.m.t + this.m.b);
@@ -136,6 +162,8 @@ export class CanvasRenderer {
       c.strokeRect(b.x, b.y, b.w, b.h);
       c.restore();
     }
+
+    this.cadru(c, scene.cadru);      // peste figuri, sub text: scrisul ramane citibil prin el
 
     for (const w of scene.words) {
       if (!(w.size > 0.5)) continue;                        // cuvant scos sau inca necrescut

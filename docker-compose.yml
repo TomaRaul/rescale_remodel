@@ -1,0 +1,62 @@
+# Trei containere, cate unul pe pagina. ACEEASI imagine in toate trei — se schimba doar
+# `ROL`, care spune fiecaruia ce pagina serveste si pe ce port asculta.
+#
+#   log               8080   autentificarea
+#   canvas-selection  8082   alegerea pânzei
+#   canvas            8081   pânza
+#
+# Nu vorbesc intre ele. Fiecare container serveste pagina lui SI toate rutele /api/*,
+# deci fiecare pagina isi cere datele de la containerul ei, pe aceeasi origine — fara
+# CORS si fara retea interna. Ce le leaga e Supabase, care e in afara.
+#
+#   docker compose up --build              toate trei
+#   docker compose up log canvas           doar doua (vezi ROLURI mai jos)
+#   docker compose up -d canvas            doar pânza, in fundal
+#   docker compose down                    opreste tot
+#
+# ROLURI spune fiecarui container CE PAGINI exista in instalare, ca sa nu trimita omul
+# intr-un port care nu ruleaza. Implicit sunt toate trei; se schimba din mediu, la
+# pornire, fara sa se atinga fisierul asta:
+#
+#   ROLURI=log,canvas docker compose up -d log canvas
+#
+# Atunci poarta duce direct in pânză, iar butonul „Pânzele mele" dispare din aplicatie —
+# in loc sa trimita amandoua intr-un port care nu raspunde.
+
+x-comun: &comun
+  build: .
+  image: smartware
+  env_file:
+    - .env
+  restart: unless-stopped
+  environment: &mediu
+    # Cele trei pagini pornite. Se poate suprascrie din mediu la `docker compose up`.
+    ROLURI: ${ROLURI:-poarta,panze,panza}
+
+services:
+  log:
+    <<: *comun
+    container_name: smartware-log
+    environment:
+      <<: *mediu
+      ROL: log
+    ports:
+      - "8080:8080"
+
+  canvas-selection:
+    <<: *comun
+    container_name: smartware-canvas-selection
+    environment:
+      <<: *mediu
+      ROL: canvas-selection
+    ports:
+      - "8082:8082"
+
+  canvas:
+    <<: *comun
+    container_name: smartware-canvas
+    environment:
+      <<: *mediu
+      ROL: canvas
+    ports:
+      - "8081:8081"

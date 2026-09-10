@@ -5,7 +5,21 @@
   "private": true,
   "description": "Restructurare de imagini cu text prin arbore binar de cautare, cu buget minim de tokeni",
   "scripts": {
-    "start": "node serve.js",
-    "test": "node test.mjs"
+    "build": "tsc",
+    "start": "npm run build && node serve.js",
+    "test": "npm run build && node test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@mastra/core": "^1.64.0",
+    "@supabase/supabase-js": "^2.116.0",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.1",
+    "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22.13.0"
   }
 }
